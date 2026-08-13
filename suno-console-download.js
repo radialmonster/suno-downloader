@@ -303,6 +303,12 @@ void (async () => {
     setTimeout(() => URL.revokeObjectURL(href), 30000);
   }
 
+  async function fetchBlob(url) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("HTTP " + res.status + " while fetching " + url);
+    return await res.blob();
+  }
+
   async function getWavUrl(id) {
     let r = await api("GET", `/api/gen/${id}/wav_file/`);
     if (r.status === 200 && r.j && r.j.wav_file_url) return r.j.wav_file_url;
@@ -339,12 +345,14 @@ void (async () => {
     const ins = data.instruments || [];
     for (let ch = 0; ch < ins.length; ch++) {
       const notes = ins[ch].notes || [];
+      const channel = ch & 0xf;
       for (const n of notes) {
         const vel = Math.max(1, Math.min(127, Math.round((n.velocity ?? 0.7) * 127)));
+        const pitch = (n.pitch ?? 60) & 0x7f;
         const onT = Math.max(0, Math.round((n.start ?? 0) * ticksPerSec));
         const offT = Math.max(onT + 1, Math.round((n.end ?? n.start ?? 0) * ticksPerSec));
-        events.push([onT, [0x90 | ch, n.pitch & 127, vel]]);
-        events.push([offT, [0x80 | ch, n.pitch & 127, 0]]);
+        events.push([onT, [0x90 | channel, pitch, vel]]);
+        events.push([offT, [0x80 | channel, pitch, 0]]);
       }
     }
     events.sort((a, b) => a[0] - b[0]);
@@ -391,7 +399,7 @@ void (async () => {
       if (await existsInFolder(d, name + ".mp3")) out.files.push("mp3:skip");
       else {
         try {
-          const blob = await (await fetch(`https://cdn1.suno.ai/${id}.mp3`)).blob();
+          const blob = await fetchBlob(`https://cdn1.suno.ai/${id}.mp3`);
           await saveToFolder(d, name + ".mp3", blob);
           out.files.push("mp3");
         } catch (e) { out.fails++; out.files.push("mp3:fail"); }
@@ -402,7 +410,7 @@ void (async () => {
       else {
         try {
           const url = await getWavUrl(id);
-          const blob = await (await fetch(url)).blob();
+          const blob = await fetchBlob(url);
           await saveToFolder(d, name + ".wav", blob);
           out.files.push("wav");
         } catch (e) { out.fails++; out.files.push("wav:fail"); }
@@ -443,7 +451,7 @@ void (async () => {
       if (dir && await existsInFolder(songDir, clean + ".mp3")) out.files.push("mp3:skip");
       else if (!dir) {
         try {
-          const blob = await (await fetch(`https://cdn1.suno.ai/${id}.mp3`)).blob();
+          const blob = await fetchBlob(`https://cdn1.suno.ai/${id}.mp3`);
           saveViaDownload(clean + ".mp3", blob);
           out.files.push("mp3");
         } catch (e) { out.fails++; out.files.push("mp3:fail"); }
@@ -454,7 +462,7 @@ void (async () => {
       else if (!dir) {
         try {
           const url = await getWavUrl(id);
-          const blob = await (await fetch(url)).blob();
+          const blob = await fetchBlob(url);
           saveViaDownload(clean + ".wav", blob);
           out.files.push("wav");
         } catch (e) { out.fails++; out.files.push("wav:fail"); }
