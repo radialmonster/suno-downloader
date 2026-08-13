@@ -518,7 +518,8 @@ void (async () => {
       getWorkspace(dir, onProgress, persistCache),
     ]);
     await persistCache(dir);
-    const out = [...scanState.songs.values()];
+    let out = [...scanState.songs.values()];
+    if (!includeStems()) out = out.filter((s) => !s.isStem);
     if (LIMIT > 0) out.splice(LIMIT);
     return { songs: out };
   }
@@ -537,6 +538,7 @@ void (async () => {
     if (cached && !rescan && !needStemRescan && cached.libDone && cached.wsDone) {
       restoreScanState(cached);
       songs = [...scanState.songs.values()];
+      if (!includeStems()) songs = songs.filter((s) => !s.isStem);
       if (LIMIT > 0) songs = songs.slice(0, LIMIT);
       setStatus(`Using cache: ${songs.length} songs.\nPress Start to download.`);
       return true;
@@ -591,44 +593,50 @@ void (async () => {
       catch (e) { setStatus("Folder picker cancelled."); return; }
     }
     setBusy(true);
-    if (!(await ensureSongs(dir))) { setBusy(false); return; }
-    const fmtNow = getFormats();
-    if (fmtNow.wav || fmtNow.midi) {
-      const parts = [];
-      if (fmtNow.wav) parts.push("WAV conversion");
-      if (fmtNow.midi) parts.push("MIDI conversion");
-      if (!confirm(
-        parts.join(" and ") +
-        " use your Suno credits and can drain your balance on a large library.\n\n" +
-        "MP3 downloads and already-generated stem downloads are free.\n\nContinue?"
-      )) { setBusy(false); setStatus("Cancelled."); return; }
-    }
-    let ok = 0, failed = 0, skipped = 0;
-    for (let i = 0; i < songs.length; i++) {
-      if (stopRequested) break;
-      const e = songs[i];
-      setStatus(`[${i + 1}/${songs.length}] ${e.title}`);
-      try {
-        const r = await download(e, dir);
-        const files = r.files.join("+");
-        const wasSkipped = r.files.some((f) => f.endsWith(":skip")) && r.files.every((f) => f.endsWith(":skip"));
-        if (!r.files.length) skipped++;
-        else if (wasSkipped) skipped++;
-        else if (r.fails > 0) failed++;
-        else ok++;
-        setStatus(`[${i + 1}/${songs.length}] ${files}\n${ok} downloaded, ${skipped} skipped, ${failed} failed`);
-      } catch (err) {
-        failed++;
-        setStatus(`[${i + 1}/${songs.length}] FAILED: ${err.message}\n${ok} downloaded, ${skipped} skipped, ${failed} failed`);
+    try {
+      if (!(await ensureSongs(dir))) return;
+      const fmtNow = getFormats();
+      if (fmtNow.wav || fmtNow.midi) {
+        const parts = [];
+        if (fmtNow.wav) parts.push("WAV conversion");
+        if (fmtNow.midi) parts.push("MIDI conversion");
+        if (!confirm(
+          parts.join(" and ") +
+          " use your Suno credits and can drain your balance on a large library.\n\n" +
+          "MP3 downloads and already-generated stem downloads are free.\n\nContinue?"
+        )) { setStatus("Cancelled."); return; }
       }
-      if (i < songs.length - 1) await stopSleep(PAUSE_MS);
+      let ok = 0, failed = 0, skipped = 0;
+      for (let i = 0; i < songs.length; i++) {
+        if (stopRequested) break;
+        const e = songs[i];
+        setStatus(`[${i + 1}/${songs.length}] ${e.title}`);
+        try {
+          const r = await download(e, dir);
+          const files = r.files.join("+");
+          const wasSkipped = r.files.some((f) => f.endsWith(":skip")) && r.files.every((f) => f.endsWith(":skip"));
+          if (!r.files.length) skipped++;
+          else if (wasSkipped) skipped++;
+          else if (r.fails > 0) failed++;
+          else ok++;
+          setStatus(`[${i + 1}/${songs.length}] ${files}\n${ok} downloaded, ${skipped} skipped, ${failed} failed`);
+        } catch (err) {
+          failed++;
+          setStatus(`[${i + 1}/${songs.length}] FAILED: ${err.message}\n${ok} downloaded, ${skipped} skipped, ${failed} failed`);
+        }
+        if (i < songs.length - 1) await stopSleep(PAUSE_MS);
+      }
+      setStatus(stopRequested
+        ? `Stopped. ${ok} downloaded, ${skipped} skipped, ${failed} failed. Rerun to resume.`
+        : `Done. ${ok} downloaded, ${skipped} skipped, ${failed} failed.`);
+      startBtn.textContent = stopRequested ? "Resume" : "Done";
+    } catch (err) {
+      setStatus("Error: " + (err && err.message ? err.message : err));
+      startBtn.textContent = "Start";
+    } finally {
+      stopRequested = false;
+      setBusy(false);
     }
-    setStatus(stopRequested
-      ? `Stopped. ${ok} downloaded, ${skipped} skipped, ${failed} failed. Rerun to resume.`
-      : `Done. ${ok} downloaded, ${skipped} skipped, ${failed} failed.`);
-    setBusy(false);
-    startBtn.textContent = stopRequested ? "Resume" : "Done";
-    stopRequested = false;
   });
 
   // small re-scan link so new songs get picked up without deleting the cache
@@ -643,6 +651,7 @@ void (async () => {
       setStatus("Re-scanning...");
       try {
         const dir = await window.showDirectoryPicker({ mode: "readwrite" });
+        pickedDir = dir;
         const cached = await readCache(dir);
         scanState.songs = new Map();
         scanState.seenIds = new Set();
