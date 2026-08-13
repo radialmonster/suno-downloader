@@ -24,7 +24,7 @@ Download all your songs from Suno as MP3 and/or WAV with one paste into the brow
 
 5. Paste the entire contents of [`suno-console-download.js`](suno-console-download.js).
 
-   > **If pasting doesn't work / is greyed out:** Chrome sometimes requires you to type `allow` first. Just type `allow` (without quotes) into the console and press Enter, then paste again. This is a built-in Chrome safety feature — nothing to do with this tool.
+   > **If pasting doesn't work / is greyed out:** Chrome sometimes requires you to type `allow pasting` first. Just type `allow pasting` (no quotes) into the console and press Enter, then paste again. This is a built-in Chrome safety feature — nothing to do with this tool.
 
 6. Press **Enter** to run it.
 
