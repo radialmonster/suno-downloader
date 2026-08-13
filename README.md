@@ -1,11 +1,11 @@
 # Suno Downloader
 
-Download all your songs from Suno as MP3 and/or WAV with one paste into the browser console. No installs, no servers, no account credentials shared with anyone — everything runs locally in your own browser.
+Download all your songs from Suno as MP3, WAV, and MIDI with one paste into the browser console. No installs, no servers, no account credentials shared with anyone — everything runs locally in your own browser.
 
 ## Features
 
 - **Downloads your full Suno library + workspace** (auto-detected via Suno's own feed)
-- **MP3 and/or WAV** — pick either or both (WAV uses Suno's converter, so it's slower per song)
+- **MP3 and/or WAV and/or MIDI** — tick whichever you want (WAV/MIDI use Suno's converters, so they're slower per song)
 - **Stems support** — optionally download your already-generated stems into each song's `stems/` folder (`Vocals.mp3`, `Drums.mp3`, ...)
 - **Per-song folders** — one unique folder per song (`<title> [<id>]/`), so duplicate titles never collide
 - **Resumable** — stop any time and rerun to continue where you left off; already-downloaded files are skipped
@@ -31,6 +31,7 @@ Download all your songs from Suno as MP3 and/or WAV with one paste into the brow
 7. A small panel appears. Tick the formats you want:
    - **MP3** — fast, works for every song
    - **WAV** — Suno converts each song first, so this is slower (a few seconds to ~30s per song)
+   - **MIDI** — Suno converts each song to note data (slowest, ~1-2 min per song)
    - **Include stems** — also downloads your existing stems (only if you have them)
 
 8. Click **Choose folder...** and pick where to save your songs.
@@ -46,6 +47,7 @@ Download all your songs from Suno as MP3 and/or WAV with one paste into the brow
   My Song [a1b2c3d4]/
     My Song.mp3
     My Song.wav
+    My Song.mid
     stems/
       Vocals.mp3
       Drums.mp3

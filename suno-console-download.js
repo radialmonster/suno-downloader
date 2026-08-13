@@ -59,6 +59,9 @@ void (async () => {
     <label style="display:flex;align-items:center;gap:8px;margin-bottom:6px;cursor:pointer">
       <input type="checkbox" id="suno-dl-wav" checked> WAV (slower, converts each song)
     </label>
+    <label style="display:flex;align-items:center;gap:8px;margin-bottom:6px;cursor:pointer">
+      <input type="checkbox" id="suno-dl-midi"> MIDI (slowest, converts each song)
+    </label>
     <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer">
       <input type="checkbox" id="suno-dl-stems"> Include stems
     </label>
@@ -71,12 +74,14 @@ void (async () => {
   const status = panel.querySelector("#suno-dl-status");
   const mp3Check = panel.querySelector("#suno-dl-mp3");
   const wavCheck = panel.querySelector("#suno-dl-wav");
+  const midiCheck = panel.querySelector("#suno-dl-midi");
   const stemsCheck = panel.querySelector("#suno-dl-stems");
   const setStatus = (t) => (status.textContent = t);
   const includeStems = () => stemsCheck.checked || INCLUDE_STEMS;
   const getFormats = () => ({
     mp3: mp3Check.checked || FORMAT === "mp3" || FORMAT === "both",
     wav: wavCheck.checked || FORMAT === "wav" || FORMAT === "both",
+    midi: midiCheck.checked,
   });
 
   // ---------- token / api ----------
@@ -272,6 +277,73 @@ void (async () => {
     throw new Error("wav conversion timed out");
   }
 
+  // MIDI: GET /api/gen/{id}/midi/ returns {"state":"running"} then
+  // {"state":"complete","instruments":[{name,is_drum,notes:[{pitch,start,end,velocity}]}]}
+  async function getMidiData(id) {
+    for (let n = 0; n < 60; n++) {
+      const r = await api("GET", `/api/gen/${id}/midi/`);
+      if (r.status >= 400) throw new Error("midi " + r.status);
+      if (r.j.state === "complete") return r.j;
+      await sleep(5000);
+    }
+    throw new Error("midi conversion timed out");
+  }
+
+  // build a standard SMF (type 0) MIDI file from Suno's instrument/note data
+  function midiToBlob(data) {
+    const PPQ = 480; // ticks per quarter note
+    const ticksPerSec = (PPQ * 120) / 60; // assume 120 BPM
+    const events = [];
+    const ins = data.instruments || [];
+    for (let ch = 0; ch < ins.length; ch++) {
+      const notes = ins[ch].notes || [];
+      for (const n of notes) {
+        const vel = Math.max(1, Math.min(127, Math.round((n.velocity ?? 0.7) * 127)));
+        const onT = Math.max(0, Math.round((n.start ?? 0) * ticksPerSec));
+        const offT = Math.max(onT + 1, Math.round((n.end ?? n.start ?? 0) * ticksPerSec));
+        events.push([onT, [0x90 | ch, n.pitch & 127, vel]]);
+        events.push([offT, [0x80 | ch, n.pitch & 127, 0]]);
+      }
+    }
+    events.sort((a, b) => a[0] - b[0]);
+    const buf = [];
+    const vlq = (v) => {
+      const b = [v & 0x7f];
+      while ((v >>= 7) > 0) b.unshift((v & 0x7f) | 0x80);
+      return b;
+    };
+    buf.push(0x4d, 0x54, 0x68, 0x64); // "MThd"
+    buf.push(0, 0, 0, 6);
+    buf.push(0, 0); // format 0
+    buf.push(0, 1); // 1 track
+    buf.push((PPQ >> 8) & 0xff, PPQ & 0xff);
+    buf.push(0x4d, 0x54, 0x72, 0x6b); // "MTrk"
+    const trackStart = buf.length;
+    let last = 0;
+    const push = (arr) => { for (const b of arr) buf.push(b & 0xff); };
+    push([0x00, 0xff, 0x51, 0x03, 0x07, 0xa1, 0x20]); // tempo 120bpm
+    for (const [t, msg] of events) {
+      push(vlq(t - last));
+      push(msg);
+      last = t;
+    }
+    push(vlq(0));
+    push([0xff, 0x2f, 0x00]); // end of track
+    const trackLen = buf.length - trackStart;
+    const lenB = [0x00, 0x00, 0x00, 0x00];
+    for (let i = 0; i < 4; i++) lenB[3 - i] = (trackLen >> (8 * i)) & 0xff;
+    buf.splice(trackStart, 0, ...lenB);
+    return new Blob([new Uint8Array(buf)], { type: "audio/midi" });
+  }
+
+  const saveMidi = async (dir2, id, name) => {
+    if (await existsInFolder(dir2, name + ".mid")) return "midi:skip";
+    const data = await getMidiData(id);
+    const blob = midiToBlob(data);
+    await saveToFolder(dir2, name + ".mid", blob);
+    return "midi";
+  };
+
   // folder for a song is always unique: "<title> [<id8>]"
   const folderFor = (e) => sanitize(e.title) + " [" + e.id.slice(0, 8) + "]";
 
@@ -303,6 +375,10 @@ void (async () => {
           results.push("wav");
         }
       }
+      if (fmt.midi) {
+        const r = await saveMidi(stemsDir, id, fname);
+        if (r) results.push(r);
+      }
       return results.join("+");
     }
     const songDir = await getOrCreateSubDir(dir, folderFor(entry));
@@ -323,6 +399,10 @@ void (async () => {
         if (songDir) await saveToFolder(songDir, clean + ".wav", blob); else saveViaDownload(clean + ".wav", blob);
         results.push("wav");
       }
+    }
+    if (fmt.midi) {
+      const r = await saveMidi(songDir, id, clean);
+      if (r) results.push(r);
     }
     return results.join("+");
   }
