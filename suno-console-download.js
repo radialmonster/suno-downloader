@@ -121,6 +121,17 @@ void (async () => {
     return (m.history || []).some((h) => h.stem_task || h.stem_from_id);
   };
 
+  // infill/section-edit clips (e.g. "[01:55.0 - 02:18.4] {verse]") are variations
+  // of a parent clip -> group them under the parent's folder
+  const infillParentId = (c) => {
+    const m = c.metadata || {};
+    if (m.task === "infill") {
+      const h = (m.history || []).find((x) => x.type === "concat_infilling" || x.infill);
+      if (h && h.id) return h.id;
+    }
+    return null;
+  };
+
   const stemName = (c) => {
     const m = c.metadata || {};
     const raw = m.stem_type_group_name || "";
@@ -133,6 +144,9 @@ void (async () => {
       e.isStem = true;
       e.parentId = c.metadata?.stem_from_id || null;
       e.stemName = stemName(c);
+    } else {
+      const p = infillParentId(c);
+      if (p) { e.isInfill = true; e.parentId = p; }
     }
     return e;
   };
@@ -393,6 +407,18 @@ void (async () => {
       if (fmt.mp3) await saveMp3(stemsDir, fname);
       if (fmt.wav) await saveWav(stemsDir, fname);
       if (fmt.midi) await saveMidi(stemsDir, fname);
+      return out;
+    }
+    if (entry.isInfill && dir) {
+      // section-edit clips (e.g. "[01:55.0 - 02:18.4] {verse]") go under the
+      // parent song's folder in a variations/ subfolder
+      const parentEntry = scanState.songs.get(parentId);
+      const parentFolder = await getOrCreateSubDir(dir, parentEntry ? folderFor(parentEntry) : clean);
+      const varsDir = await getOrCreateSubDir(parentFolder, "variations");
+      const fname = clean;
+      if (fmt.mp3) await saveMp3(varsDir, fname);
+      if (fmt.wav) await saveWav(varsDir, fname);
+      if (fmt.midi) await saveMidi(varsDir, fname);
       return out;
     }
     const songDir = await getOrCreateSubDir(dir, folderFor(entry));

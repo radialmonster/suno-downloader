@@ -53,6 +53,8 @@ Download all your songs from Suno as MP3, WAV, and MIDI with one paste into the 
       Drums.mp3
       Bass.mp3
       ...
+    variations/
+      [01:55.0 - 02:18.4] {verse].mp3   (section-edit clips, grouped under their parent song)
   Another Song [e5f6a7b8]/
     ...
   suno-cache.json          (auto-created; lets reruns skip the slow re-scan)
