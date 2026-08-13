@@ -65,6 +65,7 @@ void (async () => {
     <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer">
       <input type="checkbox" id="suno-dl-stems"> Include stems (already-generated ones, free)
     </label>
+    <div id="suno-dl-credits" style="margin-bottom:8px;padding:8px;border-radius:6px;background:#262626;font-size:12px;white-space:pre-wrap"></div>
     <button id="suno-dl-pick" style="width:100%;padding:8px;margin-bottom:6px;border:0;border-radius:6px;background:#444;color:#fff;font-weight:600;cursor:pointer">Choose folder...</button>
     <button id="suno-dl-btn" style="width:100%;padding:8px;border:0;border-radius:6px;background:#ff6b9d;color:#fff;font-weight:600;cursor:pointer">Start</button>
     <div id="suno-dl-status" style="margin-top:10px;white-space:pre-wrap;word-break:break-all"></div>`;
@@ -76,6 +77,7 @@ void (async () => {
   const wavCheck = panel.querySelector("#suno-dl-wav");
   const midiCheck = panel.querySelector("#suno-dl-midi");
   const stemsCheck = panel.querySelector("#suno-dl-stems");
+  const creditsBox = panel.querySelector("#suno-dl-credits");
   const setStatus = (t) => (status.textContent = t);
   const includeStems = () => stemsCheck.checked || INCLUDE_STEMS;
   const getFormats = () => ({
@@ -83,6 +85,25 @@ void (async () => {
     wav: wavCheck.checked || FORMAT === "wav" || FORMAT === "both",
     midi: midiCheck.checked,
   });
+
+  // show current credit balance and estimated cost of the selected options
+  async function refreshCredits() {
+    const fmt = getFormats();
+    let line = "";
+    const apiCredits = await api("GET", "/api/billing/credits", null, 1);
+    const balance = apiCredits.status === 200 && typeof apiCredits.j.total_credits_left === "number"
+      ? apiCredits.j.total_credits_left : null;
+    if (balance !== null) {
+      line += "Credits left: " + balance + "\n";
+      const wav = fmt.wav, midi = fmt.midi, stems = includeStems();
+      if (wav || midi || stems) {
+        line += "WAV/MIDI conversions use credits - cost varies, watch your balance while running.";
+      }
+    } else {
+      line += "Could not read credit balance.";
+    }
+    creditsBox.textContent = line;
+  }
 
   // ---------- token / api ----------
   let token = null;
@@ -634,4 +655,9 @@ void (async () => {
     });
     panel.appendChild(link);
   }
+
+  for (const cb of [mp3Check, wavCheck, midiCheck, stemsCheck]) {
+    cb.addEventListener("change", refreshCredits);
+  }
+  refreshCredits().catch(() => {});
 })();
