@@ -494,6 +494,15 @@ void (async () => {
     stopRequested = false;
     earlyStop = false; // stems newly requested -> must walk the full feed once
     restoreScanState(cached);
+    if (needStemRescan) {
+      // force a full re-walk so stems get collected (done flags from cache would skip it)
+      scanState.songs = new Map();
+      scanState.seenIds = new Set();
+      scanState.libCursor = null;
+      scanState.wsCursor = null;
+      scanState.libDone = false;
+      scanState.wsDone = false;
+    }
     const { songs: fresh } = await enumerateSongs(dir);
     if (stopRequested) { setStatus("Scan stopped. Progress saved - rerun to resume."); return false; }
     songs = fresh;
@@ -580,7 +589,12 @@ void (async () => {
         scanState.libDone = false;
         scanState.wsDone = false;
         earlyStop = true;
-        restoreScanState(cached);
+        if (cached && cached.songs) {
+          // seed from cache so the early-stop boundary knows what's already seen,
+          // but keep done flags false so feeds actually re-walk
+          for (const s of cached.songs) scanState.songs.set(s.id, s);
+          for (const id of cached.seenIds || []) scanState.seenIds.add(id);
+        }
         const { songs: fresh } = await enumerateSongs(dir);
         songs = fresh;
         rescan = false;
