@@ -54,10 +54,10 @@ void (async () => {
   panel.innerHTML = `
     <div style="font-weight:700;margin-bottom:8px">Suno downloader</div>
     <label style="display:flex;align-items:center;gap:8px;margin-bottom:6px;cursor:pointer">
-      <input type="checkbox" id="suno-dl-mp3" checked> MP3
+      <input type="checkbox" id="suno-dl-mp3"> MP3
     </label>
     <label style="display:flex;align-items:center;gap:8px;margin-bottom:6px;cursor:pointer">
-      <input type="checkbox" id="suno-dl-wav" checked> WAV (slower, converts each song)
+      <input type="checkbox" id="suno-dl-wav"> WAV (slower, converts each song)
     </label>
     <label style="display:flex;align-items:center;gap:8px;margin-bottom:6px;cursor:pointer">
       <input type="checkbox" id="suno-dl-midi"> MIDI (uses credits)
@@ -80,9 +80,11 @@ void (async () => {
   const creditsBox = panel.querySelector("#suno-dl-credits");
   const setStatus = (t) => (status.textContent = t);
   const includeStems = () => stemsCheck.checked || INCLUDE_STEMS;
+  mp3Check.checked = FORMAT === "mp3" || FORMAT === "both";
+  wavCheck.checked = FORMAT === "wav" || FORMAT === "both";
   const getFormats = () => ({
-    mp3: mp3Check.checked || FORMAT === "mp3" || FORMAT === "both",
-    wav: wavCheck.checked || FORMAT === "wav" || FORMAT === "both",
+    mp3: mp3Check.checked,
+    wav: wavCheck.checked,
     midi: midiCheck.checked,
   });
 
@@ -91,12 +93,11 @@ void (async () => {
     const fmt = getFormats();
     let line = "";
     const apiCredits = await api("GET", "/api/billing/credits", null, 1);
-    const balance = apiCredits.status === 200 && typeof apiCredits.j.total_credits_left === "number"
+    const balance = apiCredits.status === 200 && apiCredits.j && typeof apiCredits.j.total_credits_left === "number"
       ? apiCredits.j.total_credits_left : null;
     if (balance !== null) {
       line += "Credits left: " + balance + "\n";
-      const wav = fmt.wav, midi = fmt.midi, stems = includeStems();
-      if (wav || midi || stems) {
+      if (fmt.wav || fmt.midi) {
         line += "WAV/MIDI conversions use credits - cost varies, watch your balance while running.";
       }
     } else {
@@ -115,14 +116,16 @@ void (async () => {
     return { Authorization: "Bearer " + token, "Content-Type": "application/json" };
   };
   const api = async (method, p, body, retries = 5) => {
+    let refreshToken = false;
     for (let i = 0; i <= retries; i++) {
       const res = await fetch(API + p, {
         method,
-        headers: await headers(i > 0),
+        headers: await headers(refreshToken),
         body: body ? JSON.stringify(body) : undefined,
       });
-      if (res.status === 401 && i < retries) continue; // token expired -> refresh once
-      if (res.status === 429) {
+      refreshToken = false;
+      if (res.status === 401 && i < retries) { refreshToken = true; continue; } // token expired -> refresh
+      if (res.status === 429 && i < retries) {
         const wait = Math.min(2000 * Math.pow(2, i), 60000); // exponential: 2s,4s,8s,... max 60s
         setStatus("Rate limited - waiting " + (wait / 1000) + "s...");
         await sleep(wait);
@@ -133,6 +136,7 @@ void (async () => {
       try { j = JSON.parse(text); } catch { j = { raw: text }; }
       return { status: res.status, j };
     }
+    return { status: 0, j: { raw: "request failed after retries" } };
   };
 
   // ---------- enumeration ----------
@@ -258,7 +262,7 @@ void (async () => {
       scanState.wsCursor = cursor;
       if (!cursor) scanState.wsDone = true;
       await persist(dir);
-      if (earlyStop && items.length && known === items.length) {
+      if (earlyStop && scannedThisPage && known === scannedThisPage) {
         scanState.wsDone = true;
         scanState.wsCursor = null;
         break;
@@ -272,8 +276,8 @@ void (async () => {
     if (!parent) return null;
     try {
       return await parent.getDirectoryHandle(name, { create: true });
-    } catch {
-      return parent;
+    } catch (e) {
+      throw new Error("could not create sub-folder '" + name + "': " + e.message);
     }
   }
   async function saveToFolder(dir, name, blob) {
@@ -301,13 +305,14 @@ void (async () => {
 
   async function getWavUrl(id) {
     let r = await api("GET", `/api/gen/${id}/wav_file/`);
-    if (r.j.wav_file_url) return r.j.wav_file_url;
+    if (r.status === 200 && r.j && r.j.wav_file_url) return r.j.wav_file_url;
+    if (r.status !== 200 && r.status !== 404) throw new Error("wav_file " + r.status);
     r = await api("POST", `/api/gen/${id}/convert_wav/`);
     if (r.status >= 400) throw new Error("convert_wav " + r.status);
     for (let n = 0; n < 60; n++) {
       await sleep(5000);
       r = await api("GET", `/api/gen/${id}/wav_file/`);
-      if (r.j.wav_file_url) return r.j.wav_file_url;
+      if (r.status === 200 && r.j && r.j.wav_file_url) return r.j.wav_file_url;
     }
     throw new Error("wav conversion timed out");
   }
@@ -371,14 +376,6 @@ void (async () => {
     return new Blob([new Uint8Array(buf)], { type: "audio/midi" });
   }
 
-  const saveMidi = async (dir2, id, name) => {
-    if (await existsInFolder(dir2, name + ".mid")) return "midi:skip";
-    const data = await getMidiData(id);
-    const blob = midiToBlob(data);
-    await saveToFolder(dir2, name + ".mid", blob);
-    return "midi";
-  };
-
   // folder for a song is always unique: "<title> [<id8>]"
   const folderFor = (e) => sanitize(e.title) + " [" + e.id.slice(0, 8) + "]";
 
@@ -410,12 +407,13 @@ void (async () => {
       }
     };
     const saveMidi = async (d, name) => {
-      if (await existsInFolder(d, name + ".mid")) out.files.push("midi:skip");
+      if (d && await existsInFolder(d, name + ".mid")) out.files.push("midi:skip");
       else {
         try {
           const data = await getMidiData(id);
           const blob = midiToBlob(data);
-          await saveToFolder(d, name + ".mid", blob);
+          if (d) await saveToFolder(d, name + ".mid", blob);
+          else saveViaDownload(name + ".mid", blob);
           out.files.push("midi");
         } catch (e) { out.fails++; out.files.push("midi:fail"); }
       }
@@ -470,6 +468,7 @@ void (async () => {
 
   // ---------- cache (suno-cache.json lives in the chosen folder) ----------
   const CACHE_NAME = "suno-cache.json";
+  let persistChain = Promise.resolve();
   async function readCache(dir) {
     if (!dir) return null;
     try {
@@ -481,21 +480,25 @@ void (async () => {
   }
   async function persistCache(dir) {
     if (!dir) return;
-    try {
-      const handle = await dir.getFileHandle(CACHE_NAME, { create: true });
-      const w = await handle.createWritable();
-      await w.write(JSON.stringify({
-        savedAt: Date.now(),
-        libCursor: scanState.libCursor,
-        wsCursor: scanState.wsCursor,
-        libDone: scanState.libDone,
-        wsDone: scanState.wsDone,
-        songs: [...scanState.songs.values()],
-        seenIds: [...scanState.seenIds],
-        scanned: scanState.scanned,
-      }, null, 2));
-      await w.close();
-    } catch {}
+    const data = JSON.stringify({
+      savedAt: Date.now(),
+      libCursor: scanState.libCursor,
+      wsCursor: scanState.wsCursor,
+      libDone: scanState.libDone,
+      wsDone: scanState.wsDone,
+      songs: [...scanState.songs.values()],
+      seenIds: [...scanState.seenIds],
+      scanned: scanState.scanned,
+    }, null, 2);
+    persistChain = persistChain.then(async () => {
+      try {
+        const handle = await dir.getFileHandle(CACHE_NAME, { create: true });
+        const w = await handle.createWritable();
+        await w.write(data);
+        await w.close();
+      } catch {}
+    });
+    return persistChain;
   }
 
   function restoreScanState(cached) {
@@ -598,7 +601,8 @@ void (async () => {
         const r = await download(e, dir);
         const files = r.files.join("+");
         const wasSkipped = r.files.some((f) => f.endsWith(":skip")) && r.files.every((f) => f.endsWith(":skip"));
-        if (wasSkipped) skipped++;
+        if (!r.files.length) skipped++;
+        else if (wasSkipped) skipped++;
         else if (r.fails > 0) failed++;
         else ok++;
         setStatus(`[${i + 1}/${songs.length}] ${files}\n${ok} downloaded, ${skipped} skipped, ${failed} failed`);
