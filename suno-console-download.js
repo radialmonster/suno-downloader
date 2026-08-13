@@ -390,18 +390,21 @@ void (async () => {
   async function ensureSongs(dir) {
     if (songs.length && !rescan) return true;
     const cached = await readCache(dir);
-    if (cached && !rescan && cached.libDone && cached.wsDone) {
+    const cacheHasStems = (cached?.songs || []).some((s) => s.isStem);
+    const needStemRescan = cached && includeStems() && !cacheHasStems;
+    if (cached && !rescan && !needStemRescan && cached.libDone && cached.wsDone) {
       songs = cached.songs;
       setStatus(`Using cache: ${songs.length} songs.\nPress Start to download.`);
       return true;
     }
     stopRequested = false;
+    earlyStop = false; // stems newly requested -> must walk the full feed once
     restoreScanState(cached);
     const { songs: fresh } = await enumerateSongs(dir);
     if (stopRequested) { setStatus("Scan stopped. Progress saved - rerun to resume."); return false; }
     songs = fresh;
     if (!songs.length) { setStatus("No songs found."); return false; }
-    setStatus(`Found ${songs.length} songs.\nPress Start to download.`);
+    setStatus(`Found ${songs.length} songs (including stems).\nPress Start to download.`);
     return true;
   }
 
