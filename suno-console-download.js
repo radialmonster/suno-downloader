@@ -310,7 +310,8 @@ void (async () => {
     r = await api("POST", `/api/gen/${id}/convert_wav/`);
     if (r.status >= 400) throw new Error("convert_wav " + r.status);
     for (let n = 0; n < 60; n++) {
-      await sleep(5000);
+      await stopSleep(5000);
+      if (stopRequested) throw new Error("wav conversion stopped");
       r = await api("GET", `/api/gen/${id}/wav_file/`);
       if (r.status === 200 && r.j && r.j.wav_file_url) return r.j.wav_file_url;
     }
@@ -324,7 +325,8 @@ void (async () => {
       const r = await api("GET", `/api/gen/${id}/midi/`);
       if (r.status >= 400) throw new Error("midi " + r.status);
       if (r.j.state === "complete") return r.j;
-      await sleep(5000);
+      await stopSleep(5000);
+      if (stopRequested) throw new Error("midi conversion stopped");
     }
     throw new Error("midi conversion timed out");
   }
@@ -424,8 +426,6 @@ void (async () => {
       const stemsDir = await getOrCreateSubDir(parentFolder, "stems");
       const fname = stemName || clean;
       if (fmt.mp3) await saveMp3(stemsDir, fname);
-      if (fmt.wav) await saveWav(stemsDir, fname);
-      if (fmt.midi) await saveMidi(stemsDir, fname);
       return out;
     }
     if (entry.isInfill && dir) {
@@ -436,8 +436,6 @@ void (async () => {
       const varsDir = await getOrCreateSubDir(parentFolder, "variations");
       const fname = clean;
       if (fmt.mp3) await saveMp3(varsDir, fname);
-      if (fmt.wav) await saveWav(varsDir, fname);
-      if (fmt.midi) await saveMidi(varsDir, fname);
       return out;
     }
     const songDir = await getOrCreateSubDir(dir, folderFor(entry));
@@ -537,7 +535,9 @@ void (async () => {
     const cacheHasStems = (cached?.songs || []).some((s) => s.isStem);
     const needStemRescan = cached && includeStems() && !cacheHasStems;
     if (cached && !rescan && !needStemRescan && cached.libDone && cached.wsDone) {
-      songs = cached.songs;
+      restoreScanState(cached);
+      songs = [...scanState.songs.values()];
+      if (LIMIT > 0) songs = songs.slice(0, LIMIT);
       setStatus(`Using cache: ${songs.length} songs.\nPress Start to download.`);
       return true;
     }
@@ -592,6 +592,17 @@ void (async () => {
     }
     setBusy(true);
     if (!(await ensureSongs(dir))) { setBusy(false); return; }
+    const fmtNow = getFormats();
+    if (fmtNow.wav || fmtNow.midi) {
+      const parts = [];
+      if (fmtNow.wav) parts.push("WAV conversion");
+      if (fmtNow.midi) parts.push("MIDI conversion");
+      if (!confirm(
+        parts.join(" and ") +
+        " use your Suno credits and can drain your balance on a large library.\n\n" +
+        "MP3 downloads and already-generated stem downloads are free.\n\nContinue?"
+      )) { setBusy(false); setStatus("Cancelled."); return; }
+    }
     let ok = 0, failed = 0, skipped = 0;
     for (let i = 0; i < songs.length; i++) {
       if (stopRequested) break;
@@ -610,7 +621,7 @@ void (async () => {
         failed++;
         setStatus(`[${i + 1}/${songs.length}] FAILED: ${err.message}\n${ok} downloaded, ${skipped} skipped, ${failed} failed`);
       }
-      if (i < songs.length - 1) await sleep(PAUSE_MS);
+      if (i < songs.length - 1) await stopSleep(PAUSE_MS);
     }
     setStatus(stopRequested
       ? `Stopped. ${ok} downloaded, ${skipped} skipped, ${failed} failed. Rerun to resume.`
