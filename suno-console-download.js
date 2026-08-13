@@ -60,10 +60,10 @@ void (async () => {
       <input type="checkbox" id="suno-dl-wav" checked> WAV (slower, converts each song)
     </label>
     <label style="display:flex;align-items:center;gap:8px;margin-bottom:6px;cursor:pointer">
-      <input type="checkbox" id="suno-dl-midi"> MIDI (slowest, converts each song)
+      <input type="checkbox" id="suno-dl-midi"> MIDI (uses credits)
     </label>
     <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer">
-      <input type="checkbox" id="suno-dl-stems"> Include stems
+      <input type="checkbox" id="suno-dl-stems"> Include stems (already-generated ones, free)
     </label>
     <button id="suno-dl-pick" style="width:100%;padding:8px;margin-bottom:6px;border:0;border-radius:6px;background:#444;color:#fff;font-weight:600;cursor:pointer">Choose folder...</button>
     <button id="suno-dl-btn" style="width:100%;padding:8px;border:0;border-radius:6px;background:#ff6b9d;color:#fff;font-weight:600;cursor:pointer">Start</button>
