@@ -347,64 +347,78 @@ void (async () => {
   // folder for a song is always unique: "<title> [<id8>]"
   const folderFor = (e) => sanitize(e.title) + " [" + e.id.slice(0, 8) + "]";
 
+  // download() returns { files: "mp3+wav:fail+midi:skip", fails: 1 }
   async function download(entry, dir) {
     const { id, title, isStem, parentId, stemName } = entry;
     const clean = sanitize(title);
     const fmt = getFormats();
-    // stems go into <parent song folder>/stems/, named by stem group (Vocals, Drums, ...)
+    const out = { files: [], fails: 0 };
+    const saveMp3 = async (d, name) => {
+      if (await existsInFolder(d, name + ".mp3")) out.files.push("mp3:skip");
+      else {
+        try {
+          const blob = await (await fetch(`https://cdn1.suno.ai/${id}.mp3`)).blob();
+          await saveToFolder(d, name + ".mp3", blob);
+          out.files.push("mp3");
+        } catch (e) { out.fails++; out.files.push("mp3:fail"); }
+      }
+    };
+    const saveWav = async (d, name) => {
+      if (await existsInFolder(d, name + ".wav")) out.files.push("wav:skip");
+      else {
+        try {
+          const url = await getWavUrl(id);
+          const blob = await (await fetch(url)).blob();
+          await saveToFolder(d, name + ".wav", blob);
+          out.files.push("wav");
+        } catch (e) { out.fails++; out.files.push("wav:fail"); }
+      }
+    };
+    const saveMidi = async (d, name) => {
+      if (await existsInFolder(d, name + ".mid")) out.files.push("midi:skip");
+      else {
+        try {
+          const data = await getMidiData(id);
+          const blob = midiToBlob(data);
+          await saveToFolder(d, name + ".mid", blob);
+          out.files.push("midi");
+        } catch (e) { out.fails++; out.files.push("midi:fail"); }
+      }
+    };
     if (isStem && dir) {
       const parentEntry = scanState.songs.get(parentId);
       const parentFolder = await getOrCreateSubDir(dir, parentEntry ? folderFor(parentEntry) : clean);
       const stemsDir = await getOrCreateSubDir(parentFolder, "stems");
       const fname = stemName || clean;
-      const results = [];
-      if (fmt.mp3) {
-        if (await existsInFolder(stemsDir, fname + ".mp3")) results.push("mp3:skip");
-        else {
-          const blob = await (await fetch(`https://cdn1.suno.ai/${id}.mp3`)).blob();
-          await saveToFolder(stemsDir, fname + ".mp3", blob);
-          results.push("mp3");
-        }
-      }
-      if (fmt.wav) {
-        if (await existsInFolder(stemsDir, fname + ".wav")) results.push("wav:skip");
-        else {
-          const url = await getWavUrl(id);
-          const blob = await (await fetch(url)).blob();
-          await saveToFolder(stemsDir, fname + ".wav", blob);
-          results.push("wav");
-        }
-      }
-      if (fmt.midi) {
-        const r = await saveMidi(stemsDir, id, fname);
-        if (r) results.push(r);
-      }
-      return results.join("+");
+      if (fmt.mp3) await saveMp3(stemsDir, fname);
+      if (fmt.wav) await saveWav(stemsDir, fname);
+      if (fmt.midi) await saveMidi(stemsDir, fname);
+      return out;
     }
     const songDir = await getOrCreateSubDir(dir, folderFor(entry));
-    const results = [];
     if (fmt.mp3) {
-      if (dir && await existsInFolder(songDir, clean + ".mp3")) results.push("mp3:skip");
-      else {
-        const blob = await (await fetch(`https://cdn1.suno.ai/${id}.mp3`)).blob();
-        if (songDir) await saveToFolder(songDir, clean + ".mp3", blob); else saveViaDownload(clean + ".mp3", blob);
-        results.push("mp3");
-      }
+      if (dir && await existsInFolder(songDir, clean + ".mp3")) out.files.push("mp3:skip");
+      else if (!dir) {
+        try {
+          const blob = await (await fetch(`https://cdn1.suno.ai/${id}.mp3`)).blob();
+          saveViaDownload(clean + ".mp3", blob);
+          out.files.push("mp3");
+        } catch (e) { out.fails++; out.files.push("mp3:fail"); }
+      } else await saveMp3(songDir, clean);
     }
     if (fmt.wav) {
-      if (dir && await existsInFolder(songDir, clean + ".wav")) results.push("wav:skip");
-      else {
-        const url = await getWavUrl(id);
-        const blob = await (await fetch(url)).blob();
-        if (songDir) await saveToFolder(songDir, clean + ".wav", blob); else saveViaDownload(clean + ".wav", blob);
-        results.push("wav");
-      }
+      if (dir && await existsInFolder(songDir, clean + ".wav")) out.files.push("wav:skip");
+      else if (!dir) {
+        try {
+          const url = await getWavUrl(id);
+          const blob = await (await fetch(url)).blob();
+          saveViaDownload(clean + ".wav", blob);
+          out.files.push("wav");
+        } catch (e) { out.fails++; out.files.push("wav:fail"); }
+      } else await saveWav(songDir, clean);
     }
-    if (fmt.midi) {
-      const r = await saveMidi(songDir, id, clean);
-      if (r) results.push(r);
-    }
-    return results.join("+");
+    if (fmt.midi) await saveMidi(songDir, clean);
+    return out;
   }
 
   // ---------- cache (suno-cache.json lives in the chosen folder) ----------
@@ -525,10 +539,13 @@ void (async () => {
       const e = songs[i];
       setStatus(`[${i + 1}/${songs.length}] ${e.title}`);
       try {
-        const got = await download(e, dir);
-        if (got.includes("skip")) skipped++;
+        const r = await download(e, dir);
+        const files = r.files.join("+");
+        const wasSkipped = r.files.some((f) => f.endsWith(":skip")) && r.files.every((f) => f.endsWith(":skip"));
+        if (wasSkipped) skipped++;
+        else if (r.fails > 0) failed++;
         else ok++;
-        setStatus(`[${i + 1}/${songs.length}] ${got}\n${ok} downloaded, ${skipped} skipped, ${failed} failed`);
+        setStatus(`[${i + 1}/${songs.length}] ${files}\n${ok} downloaded, ${skipped} skipped, ${failed} failed`);
       } catch (err) {
         failed++;
         setStatus(`[${i + 1}/${songs.length}] FAILED: ${err.message}\n${ok} downloaded, ${skipped} skipped, ${failed} failed`);
