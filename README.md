@@ -31,7 +31,7 @@ Download all your songs from Suno as MP3, WAV, and MIDI with one paste into the 
 
 7. A small panel appears. Tick the formats you want:
    - **MP3** — fast, works for every song
-   - **WAV** — Suno converts each song first, so this is slower (a few seconds to ~30s per song)
+   - **WAV** — Suno converts each song first, which uses credits and is slower (a few seconds to ~30s per song)
    - **MIDI** — Suno converts each song to note data (slowest, ~1-2 min per song). **Uses your account credits.**
    - **Include stems** — also downloads your existing stems (only if you have them). Stems must have been generated in Suno first (click "Get stems" on a song in Suno, which costs credits) — this tool only *downloads* stems that already exist, it never generates them.
 
@@ -67,7 +67,7 @@ Download all your songs from Suno as MP3, WAV, and MIDI with one paste into the 
 ## Resuming and re-scanning
 
 - **Rerun to resume** — the script skips songs that are already downloaded, so a stopped run picks up exactly where it left off.
-- **Re-scan for new songs** — if you've created songs since your last scan, click the "Re-scan for new songs" link. It only scans forward until it hits songs you've already seen, so it's fast even for large libraries.
+- **Re-scan for new songs** — if you've created songs since your last scan, click the "Re-scan for new songs" link. It scans forward until it reaches a full page of clips it has already seen, so it's fast even for large libraries.
 - **Cache errors are not hidden** — if `suno-cache.json` is unreadable or malformed, the panel reports the problem instead of silently replacing resume state.
 
 ## First scan takes a few minutes

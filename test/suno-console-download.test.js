@@ -595,6 +595,38 @@ test("an unknown WAV status shape cannot trigger a paid conversion", async () =>
   assert.match(runtime.status(), /0 downloaded, 0 skipped, 1 failed/);
 });
 
+test("clip IDs are encoded as one URL segment for paid WAV requests", async () => {
+  const id = "clip?part/#one";
+  const encoded = encodeURIComponent(id);
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id, title: "Encoded path" },
+  ]));
+  const runtime = createRuntime({
+    directory,
+    fetch: async (url, init = {}) => {
+      url = String(url);
+      runtime.calls.push({ url, init });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 100 });
+      if (url.endsWith(`/api/gen/${encoded}/wav_file/`)) return jsonResponse({}, 404);
+      if (url.endsWith(`/api/gen/${encoded}/convert_wav/`))
+        return jsonResponse({ wav_file_url: "https://cdn.example/encoded.wav" });
+      if (url === "https://cdn.example/encoded.wav")
+        return new Response(new Blob([WAV_BYTES]), { status: 200, headers: { "content-type": "audio/wav" } });
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-mp3").checked = false;
+  runtime.element("suno-dl-wav").checked = true;
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "encoded WAV path test did not finish", 3000);
+  const conversion = runtime.calls.find((call) => call.url.endsWith(`/api/gen/${encoded}/convert_wav/`));
+  assert.ok(conversion, "the encoded conversion endpoint was not requested");
+  assert.equal(conversion.init.method, "POST");
+  assert.equal(runtime.calls.some((call) => call.url.includes("/api/gen/clip?part")), false);
+  assert.match(runtime.status(), /1 downloaded, 0 skipped, 0 failed/);
+});
+
 test("old complete caches remain usable without a feed scan", async () => {
   const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
     { id: "legacy000001", title: "Legacy song" },
@@ -624,6 +656,57 @@ test("disabled feeds are persisted as complete for cache reuse", async () => {
   const cache = JSON.parse(await (await directory.getFileHandle("suno-cache.json")).getFile().then((file) => file.text()));
   assert.equal(cache.libDone, true, "a deliberately disabled feed left the cache permanently partial");
   assert.equal(cache.wsDone, true);
+  assert.equal(cache.includeLibrary, false);
+  assert.equal(cache.includeWorkspace, true);
+});
+
+test("enabling a previously disabled feed forces a clean cache re-scan", async () => {
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "workspace001", title: "Workspace only" },
+  ], { includeLibrary: false, includeWorkspace: true }));
+  const runtime = createRuntime({
+    directory,
+    libraryClips: [{ id: "library00001", title: "Library song", status: "complete", metadata: {} }],
+    workspaceItems: [{
+      type: "clip",
+      clip: { id: "workspace001", title: "Workspace only", status: "complete", metadata: {} },
+    }],
+  });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "feed-selection expansion did not finish", 3000);
+  assert.equal(runtime.calls.some((call) => call.url.endsWith("/api/feed/v3")), true);
+  assert.ok(directory.paths().some((name) => name.endsWith("Library song.mp3")));
+  const cache = JSON.parse(await (await directory.getFileHandle("suno-cache.json")).getFile().then((file) => file.text()));
+  assert.equal(cache.includeLibrary, true);
+  assert.equal(cache.includeWorkspace, true);
+  assert.deepEqual(new Set(cache.songs.map((song) => song.id)), new Set(["library00001", "workspace001"]));
+});
+
+test("manual re-scan drops cached entries from a feed that is now disabled", async () => {
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "library00001", title: "Stale library song" },
+    { id: "workspace001", title: "Workspace song" },
+  ], { includeLibrary: true, includeWorkspace: true }));
+  const runtime = createRuntime({
+    directory,
+    script: SCRIPT.replace("const INCLUDE_LIBRARY = true", "const INCLUDE_LIBRARY = false"),
+    workspaceItems: [{
+      type: "clip",
+      clip: { id: "workspace001", title: "Workspace song", status: "complete", metadata: {} },
+    }],
+  });
+  runtime.run();
+  const rescan = runtime.document.walk().find((element) => element.textContent === "Re-scan for new songs");
+  rescan.click();
+  await waitFor(() => /Re-scan complete/.test(runtime.status()), "feed-selection re-scan did not finish", 3000);
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "post-rescan download did not finish", 3000);
+  assert.equal(runtime.calls.some((call) => call.url.endsWith("/api/feed/v3")), false);
+  assert.equal(directory.paths().some((name) => name.endsWith("Stale library song.mp3")), false);
+  assert.ok(directory.paths().some((name) => name.endsWith("Workspace song.mp3")));
+  const cache = JSON.parse(await (await directory.getFileHandle("suno-cache.json")).getFile().then((file) => file.text()));
+  assert.deepEqual(cache.songs.map((song) => song.id), ["workspace001"]);
 });
 
 test("malformed caches are reported and are not silently overwritten", async () => {
@@ -655,6 +738,21 @@ test("a cache missing its song list is rejected instead of treated as an empty l
   runtime.element("suno-dl-btn").click();
   await waitFor(() => /songs.*array/i.test(runtime.status()), "missing song list was not reported");
   assert.equal(runtime.calls.some((call) => /\/api\/(feed\/v3|project\/feed)/.test(call.url)), false);
+  assert.equal(await (await directory.getFileHandle("suno-cache.json")).getFile().then((file) => file.text()), original);
+});
+
+test("duplicate song IDs in a cache are rejected instead of silently dropping an entry", async () => {
+  const original = completeCache([
+    { id: "duplicate001", title: "First entry" },
+    { id: "duplicate001", title: "Second entry" },
+  ]);
+  const directory = new MemoryDirectory().seed("suno-cache.json", original);
+  const runtime = createRuntime({ directory });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /duplicate song IDs/i.test(runtime.status()), "duplicate cache IDs were not reported");
+  assert.equal(runtime.calls.some((call) => /\/api\/(feed\/v3|project\/feed)/.test(call.url)), false);
+  assert.equal(runtime.calls.some((call) => /cdn/i.test(call.url)), false);
   assert.equal(await (await directory.getFileHandle("suno-cache.json")).getFile().then((file) => file.text()), original);
 });
 
@@ -1143,6 +1241,31 @@ test("an ID3 header without MPEG audio frames is rejected", async () => {
   runtime.element("suno-dl-btn").click();
   await waitFor(() => /^Done\./.test(runtime.status()), "ID3-only response test did not finish");
   assert.match(runtime.status(), /MP3: response is not an MP3 file/i);
+  assert.equal(directory.paths().some((name) => name.endsWith(".mp3")), false);
+});
+
+test("a truncated second MPEG frame is rejected instead of being saved as MP3", async () => {
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "truncated001", title: "Truncated MP3" },
+  ]));
+  const truncated = new Uint8Array(421);
+  truncated.set([0xff, 0xfb, 0x90, 0x00], 0);
+  truncated.set([0xff, 0xfb, 0x90, 0x00], 417);
+  const runtime = createRuntime({
+    directory,
+    fetch: async (url) => {
+      url = String(url);
+      runtime.calls.push({ url });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 1 });
+      if (url.startsWith("https://cdn1.suno.ai/"))
+        return new Response(new Blob([truncated]), { status: 200, headers: { "content-type": "audio/mpeg" } });
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "truncated-frame test did not finish");
+  assert.match(runtime.status(), /1 failed/);
   assert.equal(directory.paths().some((name) => name.endsWith(".mp3")), false);
 });
 

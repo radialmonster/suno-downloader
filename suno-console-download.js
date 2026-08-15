@@ -136,7 +136,7 @@ void (async () => {
       <input type="checkbox" id="suno-dl-mp3"> MP3
     </label>
     <label style="display:flex;align-items:center;gap:8px;margin-bottom:6px;cursor:pointer">
-      <input type="checkbox" id="suno-dl-wav"> WAV (slower, converts each song)
+      <input type="checkbox" id="suno-dl-wav"> WAV (conversion uses credits)
     </label>
     <label style="display:flex;align-items:center;gap:8px;margin-bottom:6px;cursor:pointer">
       <input type="checkbox" id="suno-dl-midi"> MIDI (uses credits)
@@ -430,6 +430,15 @@ void (async () => {
   };
 
   const queryCursor = (cursor) => typeof cursor === "string" ? cursor : JSON.stringify(cursor);
+  const cacheMatchesFeedSelection = (cached) => {
+    if (!cached) return true;
+    const hasSelection = cached.includeLibrary !== undefined || cached.includeWorkspace !== undefined;
+    // Legacy caches were created with both feeds enabled by default. Preserve
+    // their fast resume path for that default, but non-default configurations
+    // must re-scan because old entries have no feed provenance.
+    if (!hasSelection) return INCLUDE_LIBRARY && INCLUDE_WORKSPACE;
+    return cached.includeLibrary === INCLUDE_LIBRARY && cached.includeWorkspace === INCLUDE_WORKSPACE;
+  };
 
   async function getLibrary(dir, onProgress, persist) {
     if (!INCLUDE_LIBRARY || scanState.libDone) return;
@@ -687,7 +696,9 @@ void (async () => {
         : head;
       const hasTwoFramesAt = (offset) => {
         const length = mpegFrameLength(audioHead, offset);
-        return length > 0 && mpegFrameLength(audioHead, offset + length) > 0;
+        const secondOffset = offset + length;
+        const secondLength = length > 0 ? mpegFrameLength(audioHead, secondOffset) : 0;
+        return secondLength > 0 && audioOffset + secondOffset + secondLength <= blob.size;
       };
       let frame = hasTwoFramesAt(0);
       // When encoders put a small non-ID3 preamble before audio, require two
@@ -751,7 +762,7 @@ void (async () => {
   }
 
   async function fetchMp3(entry) {
-    const fallback = `https://cdn1.suno.ai/${entry.id}.mp3`;
+    const fallback = `https://cdn1.suno.ai/${encodeURIComponent(String(entry.id))}.mp3`;
     const preferred = typeof entry.audioUrl === "string" ? entry.audioUrl : fallback;
     try {
       return await fetchBlob(preferred, "mp3");
@@ -790,7 +801,8 @@ void (async () => {
 
   async function getWavUrl(id) {
     if (!operationOptions?.creditApproved) throw new Error("WAV conversion was not approved");
-    let r = await api("GET", `/api/gen/${id}/wav_file/`);
+    const encodedId = encodeURIComponent(String(id));
+    let r = await api("GET", `/api/gen/${encodedId}/wav_file/`);
     let wav = parseWavStatus(r);
     if (wav.state === "ready") return wav.url;
     if (wav.state === "error") throw new Error("wav_file " + r.status);
@@ -799,7 +811,7 @@ void (async () => {
     // Never automatically resubmit it. One retry remains available only for the
     // explicit 401 path, which is known not to have run the conversion.
     if (!alreadyPending)
-      r = await api("POST", `/api/gen/${id}/convert_wav/`, null, 1, { retryAmbiguous: false });
+      r = await api("POST", `/api/gen/${encodedId}/convert_wav/`, null, 1, { retryAmbiguous: false });
     // A network failure or 5xx may happen after the paid request reached Suno.
     // Poll the read-only result endpoint in that ambiguous case, but never risk
     // a second conversion POST. Explicit 4xx responses are safe to surface.
@@ -817,7 +829,7 @@ void (async () => {
     for (let n = 0; n < 60; n++) {
       await stopSleep(5000);
       if (stopRequested) throw new Error("wav conversion stopped");
-      r = await api("GET", `/api/gen/${id}/wav_file/`);
+      r = await api("GET", `/api/gen/${encodedId}/wav_file/`);
       wav = parseWavStatus(r);
       if (wav.state === "ready") return wav.url;
       if (wav.state === "error") throw new Error("wav_file " + r.status);
@@ -831,8 +843,9 @@ void (async () => {
   // {"state":"complete","instruments":[{name,is_drum,notes:[{pitch,start,end,velocity}]}]}
   async function getMidiData(id) {
     if (!operationOptions?.creditApproved) throw new Error("MIDI conversion was not approved");
+    const encodedId = encodeURIComponent(String(id));
     for (let n = 0; n < 60; n++) {
-      const r = await api("GET", `/api/gen/${id}/midi/`);
+      const r = await api("GET", `/api/gen/${encodedId}/midi/`);
       if (r.status !== 200) throw new Error("midi " + r.status + ": " + (r.j?.raw || r.j?.detail || "unexpected response"));
       if (r.j?.state === "complete") {
         if (!Array.isArray(r.j.instruments)) throw new Error("midi response missing instruments");
@@ -1209,8 +1222,17 @@ void (async () => {
         throw new Error("cache wsDone field is not a boolean");
       if (cached.stemsIncluded !== undefined && typeof cached.stemsIncluded !== "boolean")
         throw new Error("cache stemsIncluded field is not a boolean");
+      const hasIncludeLibrary = cached.includeLibrary !== undefined;
+      const hasIncludeWorkspace = cached.includeWorkspace !== undefined;
+      if (hasIncludeLibrary !== hasIncludeWorkspace)
+        throw new Error("cache feed selection fields are incomplete");
+      if (hasIncludeLibrary && (typeof cached.includeLibrary !== "boolean" ||
+          typeof cached.includeWorkspace !== "boolean"))
+        throw new Error("cache feed selection fields are not boolean");
       if ((cached.songs || []).some((song) => !song || typeof song !== "object" || typeof song.id !== "string"))
         throw new Error("cache contains an invalid song entry");
+      if (new Set(cached.songs.map((song) => song.id)).size !== cached.songs.length)
+        throw new Error("cache contains duplicate song IDs");
       if ((cached.songs || []).some((song) => song.stemOutputBase !== undefined &&
           typeof song.stemOutputBase !== "string"))
         throw new Error("cache contains an invalid persisted stem filename");
@@ -1238,6 +1260,8 @@ void (async () => {
       libDone: scanState.libDone,
       wsDone: scanState.wsDone,
       stemsIncluded: scanState.stemsIncluded,
+      includeLibrary: INCLUDE_LIBRARY,
+      includeWorkspace: INCLUDE_WORKSPACE,
       songs: [...scanState.songs.values()],
       seenIds: [...scanState.seenIds],
       scanned: scanState.scanned,
@@ -1330,7 +1354,8 @@ void (async () => {
       ? cached.stemsIncluded
       : (cached.songs || []).some((s) => s.isStem));
     const needStemRescan = cached && includeStems() && !cacheIncludedStems;
-    if (cached && !rescan && !needStemRescan && cached.libDone && cached.wsDone) {
+    const needFeedRescan = cached && !cacheMatchesFeedSelection(cached);
+    if (cached && !rescan && !needStemRescan && !needFeedRescan && cached.libDone && cached.wsDone) {
       restoreScanState(cached);
       if (assignStableOutputBases()) await persistCache(dir);
       songs = [...scanState.songs.values()];
@@ -1344,9 +1369,9 @@ void (async () => {
     stopRequested = false;
     earlyStopLibrary = false; // normal/partial-cache scans resume from their saved cursors
     earlyStopWorkspace = false;
-    if (cached) restoreScanState(cached);
+    if (cached && !needFeedRescan) restoreScanState(cached);
     else resetScanState();
-    if (needStemRescan) {
+    if (needStemRescan && !needFeedRescan) {
       // force a full re-walk so stems get collected (done flags from cache would skip it)
       scanState.songs = new Map();
       scanState.seenIds = new Set();
@@ -1529,8 +1554,9 @@ void (async () => {
         if (stopRequested) { setStatus("Re-scan stopped before scanning."); return; }
         pickedDir = dir;
         const cached = await readCache(dir);
+        const feedSelectionMatches = cacheMatchesFeedSelection(cached);
         resetScanState();
-        scanState.stemsIncluded = !!(cached && (typeof cached.stemsIncluded === "boolean"
+        scanState.stemsIncluded = !!(cached && feedSelectionMatches && (typeof cached.stemsIncluded === "boolean"
           ? cached.stemsIncluded
           : (cached.songs || []).some((s) => s.isStem)));
         // If this cache predates a stem-inclusive scan, walk every page once;
@@ -1539,10 +1565,10 @@ void (async () => {
         // A partial cache only proves that its already-seen newest pages are
         // known; older pages may never have been scanned. Apply the newest-first
         // early boundary separately, and only to feeds previously completed.
-        earlyStopLibrary = canEarlyStop && cached?.libDone === true;
-        earlyStopWorkspace = canEarlyStop && cached?.wsDone === true;
-        knownBeforeRescan = new Set(cached?.seenIds || []);
-        if (cached && cached.songs) {
+        earlyStopLibrary = feedSelectionMatches && canEarlyStop && cached?.libDone === true;
+        earlyStopWorkspace = feedSelectionMatches && canEarlyStop && cached?.wsDone === true;
+        knownBeforeRescan = new Set(feedSelectionMatches ? (cached?.seenIds || []) : []);
+        if (cached && feedSelectionMatches && cached.songs) {
           // seed from cache so the early-stop boundary knows what's already seen,
           // but keep done flags false so feeds actually re-walk
           for (const s of cached.songs) scanState.songs.set(s.id, s);
