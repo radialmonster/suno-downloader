@@ -8,9 +8,9 @@ Download all your songs from Suno as MP3, WAV, and MIDI with one paste into the 
 - **MP3 and/or WAV and/or MIDI** — tick whichever you want (WAV/MIDI use Suno's converters, so they're slower per song)
 - **Stems support** — optionally download your already-generated stems into each song's `stems/` folder (`Vocals.mp3`, `Drums.mp3`, ...); every member of a repeated generation gets a clip ID so none overwrite each other
 - **Section-edit clips grouped** — Suno's "replace section" variations (e.g. `[01:55.0 - 02:18.4] {verse]`) are filed under their parent song's `variations/` folder
-- **Per-song folders** — one unique folder per song (`<title> [<id>]/`), so duplicate titles never collide; unsafe or overlong filename characters are normalized for portability
-- **Resumable** — stop any time and rerun to continue where you left off; already-downloaded files are skipped
-- **One-time scan** — a cache file (`suno-cache.json`) remembers your song list, so reruns are instant
+- **Per-song folders** — one unique folder per song (`<title> [<id>]/`), so duplicate titles never collide; unsafe or overlong filename characters are normalized for portability (with the Chrome/Edge folder picker)
+- **Resumable folder downloads** — stop any time and rerun to continue where you left off; already-downloaded files are skipped
+- **One-time folder scan** — a cache file (`suno-cache.json`) remembers your song list, so reruns are instant
 - **Zero installs** — just a script pasted into DevTools
 
 ## How to use
@@ -41,7 +41,7 @@ Download all your songs from Suno as MP3, WAV, and MIDI with one paste into the 
 
 9. Click **Start**.
 
-> Chrome or Edge is required for the folder picker. On Firefox/Safari it falls back to normal per-file downloads.
+> Chrome or Edge is required for the folder picker, per-song folders, cache, and automatic resume/skip behavior. On Firefox/Safari it falls back to normal per-file downloads; the browser controls duplicate naming, and reruns cannot inspect or skip files you already downloaded.
 
 ## What you get
 

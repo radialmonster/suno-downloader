@@ -232,7 +232,7 @@ function createRuntime(options = {}) {
       return typeof options.confirm === "function" ? options.confirm(message) : (options.confirm ?? true);
     },
     setTimeout: (callback, ms) => {
-      if (ms >= 30000) return { ignored: true };
+      if (ms >= 30000 && !options.fireLongTimers) return { ignored: true };
       return setTimeout(callback, options.timerDelay ?? 0);
     },
     clearTimeout: (id) => { if (id && !id.ignored) clearTimeout(id); },
@@ -357,9 +357,55 @@ test("re-paste waits for an old in-flight file write before initializing", async
   runtime.run();
   assert.equal(runtime.document.querySelectorAll("#suno-bulk-downloader-panel").length, 0,
     "replacement panel initialized before the old write settled");
+  runtime.run();
+  assert.equal(runtime.document.querySelectorAll("#suno-bulk-downloader-panel").length, 0,
+    "newest replacement did not wait for an already-pending replacement");
   releaseClose();
   await waitFor(() => runtime.document.querySelectorAll("#suno-bulk-downloader-panel").length === 1,
     "replacement panel did not initialize after the old write settled");
+  await tick();
+  assert.equal(runtime.calls.filter((call) => call.url.endsWith("/api/billing/credits")).length, 2,
+    "an intermediate replacement initialized alongside the newest paste");
+});
+
+test("re-paste waits for a pending file handle and prevents the stale write", async () => {
+  let releaseHandle;
+  let handleRequested = false;
+  const handleGate = new Promise((resolve) => { releaseHandle = resolve; });
+  class HoldingDirectory extends MemoryDirectory {
+    async getDirectoryHandle(name, options = {}) {
+      let directory = this.directories.get(name);
+      if (!directory && options.create) {
+        directory = new HoldingDirectory(name);
+        this.directories.set(name, directory);
+      }
+      if (!directory) return super.getDirectoryHandle(name, options);
+      return directory;
+    }
+
+    async getFileHandle(name, options = {}) {
+      if (name.endsWith(".mp3")) {
+        handleRequested = true;
+        await handleGate;
+      }
+      return super.getFileHandle(name, options);
+    }
+  }
+  const directory = new HoldingDirectory().seed("suno-cache.json", completeCache([
+    { id: "handle000001", title: "Held handle" },
+  ]));
+  const runtime = createRuntime({ directory });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => handleRequested, "file handle request did not start");
+  runtime.run();
+  assert.equal(runtime.document.querySelectorAll("#suno-bulk-downloader-panel").length, 0,
+    "replacement panel initialized while an old file handle was pending");
+  releaseHandle();
+  await waitFor(() => runtime.document.querySelectorAll("#suno-bulk-downloader-panel").length === 1,
+    "replacement panel did not initialize after the old save settled");
+  assert.equal(directory.paths().some((name) => name.endsWith(".mp3")), false,
+    "destroyed instance wrote a file after replacement");
 });
 
 test("busy operations lock formats, folder selection, Start, and re-scan", async () => {
@@ -399,6 +445,44 @@ for (const format of ["wav", "midi"]) {
   });
 }
 
+test("an ambiguous WAV conversion request is polled without a second paid POST", async () => {
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "wavambiguous1", title: "Ambiguous WAV" },
+  ]));
+  let wavChecks = 0;
+  let convertPosts = 0;
+  const runtime = createRuntime({
+    directory,
+    fetch: async (url, init = {}) => {
+      url = String(url);
+      runtime.calls.push({ url, init });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 100 });
+      if (url.includes("/api/gen/wavambiguous1/wav_file/")) {
+        wavChecks++;
+        return wavChecks === 1
+          ? jsonResponse({ detail: "not ready" }, 404)
+          : jsonResponse({ wav_file_url: "https://cdn.example/ready.wav" });
+      }
+      if (url.includes("/api/gen/wavambiguous1/convert_wav/")) {
+        convertPosts++;
+        throw new TypeError("connection lost after request upload");
+      }
+      if (url === "https://cdn.example/ready.wav")
+        return new Response(new Blob(["wav"]), { status: 200, headers: { "content-type": "audio/wav" } });
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-mp3").checked = false;
+  runtime.element("suno-dl-wav").checked = true;
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "ambiguous WAV recovery did not finish", 3000);
+  assert.equal(convertPosts, 1, "ambiguous paid request must never be resubmitted");
+  assert.ok(wavChecks >= 2, "read-only WAV result was not polled");
+  assert.match(runtime.status(), /1 downloaded, 0 skipped, 0 failed/);
+  assert.ok(directory.paths().some((name) => name.endsWith("Ambiguous WAV.wav")));
+});
+
 test("old complete caches remain usable without a feed scan", async () => {
   const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
     { id: "legacy000001", title: "Legacy song" },
@@ -419,6 +503,50 @@ test("malformed caches are reported and are not silently overwritten", async () 
   await waitFor(() => /cache|json/i.test(runtime.status()), "malformed cache failure was not shown");
   assert.equal(runtime.calls.some((call) => call.url.includes("/api/feed/v3") || call.url.includes("/api/project/feed")), false);
   assert.equal(await (await directory.getFileHandle("suno-cache.json")).getFile().then((file) => file.text()), "{ definitely not json");
+});
+
+test("non-boolean cache completion flags are rejected instead of bypassing a scan", async () => {
+  const original = JSON.stringify({ songs: [], seenIds: [], libDone: "false", wsDone: true });
+  const directory = new MemoryDirectory().seed("suno-cache.json", original);
+  const runtime = createRuntime({ directory });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /libDone.*boolean/i.test(runtime.status()), "invalid done flag was not reported");
+  assert.equal(runtime.calls.some((call) => call.url.includes("/api/feed/v3")), false);
+  assert.equal(await (await directory.getFileHandle("suno-cache.json")).getFile().then((file) => file.text()), original);
+});
+
+test("a cache missing its song list is rejected instead of treated as an empty library", async () => {
+  const original = JSON.stringify({ seenIds: [], libDone: true, wsDone: true });
+  const directory = new MemoryDirectory().seed("suno-cache.json", original);
+  const runtime = createRuntime({ directory });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /songs.*array/i.test(runtime.status()), "missing song list was not reported");
+  assert.equal(runtime.calls.some((call) => /\/api\/(feed\/v3|project\/feed)/.test(call.url)), false);
+  assert.equal(await (await directory.getFileHandle("suno-cache.json")).getFile().then((file) => file.text()), original);
+});
+
+test("resuming a partial stem scan without stems downgrades the completed cache", async () => {
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "oldstem00001", title: "Vocals", isStem: true, parentId: "parent000001", stemName: "Vocals" },
+  ], {
+    stemsIncluded: true,
+    libDone: false,
+    libCursor: "resume-cursor",
+    wsDone: true,
+  }));
+  const runtime = createRuntime({
+    directory,
+    libraryClips: [{ id: "song00000001", title: "Song", status: "complete", metadata: {} }],
+  });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "partial-cache resume did not finish");
+  const cache = JSON.parse(await (await directory.getFileHandle("suno-cache.json")).getFile().then((file) => file.text()));
+  assert.equal(cache.libDone, true);
+  assert.equal(cache.stemsIncluded, false,
+    "cache must not claim complete stem coverage after pages were scanned with stems disabled");
 });
 
 test("cache write failures are visible and prevent downloading an unresumable scan", async () => {
@@ -453,6 +581,17 @@ test("network retries terminate and restore the UI", async () => {
   assert.match(runtime.status(), /^Error: library feed error 0/);
   assert.equal(feedAttempts, 6);
   assert.equal(runtime.element("suno-dl-btn").disabled, false);
+});
+
+test("a hung authentication token request times out and restores the UI", async () => {
+  const runtime = createRuntime({ fireLongTimers: true });
+  runtime.context.Clerk.session.getToken = async () => new Promise(() => {});
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => !runtime.element("suno-dl-btn").disabled,
+    "hung authentication did not restore the UI", 5000);
+  assert.match(runtime.status(), /^Error: library feed error 0: request timed out after retries/);
+  assert.equal(runtime.calls.length, 0, "a request was sent without an authentication token");
 });
 
 test("Stop cancels a rate-limit retry before another request", async () => {
@@ -565,6 +704,74 @@ test("empty successful CDN responses are rejected rather than counted as downloa
   assert.equal(directory.paths().some((name) => name.endsWith(".mp3")), false);
 });
 
+test("CDN retries are finite and recover a transient download failure", async () => {
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "retrycdn0001", title: "Retry CDN" },
+  ]));
+  let cdnAttempts = 0;
+  const runtime = createRuntime({
+    directory,
+    fetch: async (url) => {
+      url = String(url);
+      runtime.calls.push({ url });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 1 });
+      if (url.startsWith("https://cdn1.suno.ai/")) {
+        cdnAttempts++;
+        if (cdnAttempts < 3) throw new TypeError("transient CDN failure");
+        return new Response(new Blob(["mp3"]), { status: 200, headers: { "content-type": "audio/mpeg" } });
+      }
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "CDN retry test did not finish", 3000);
+  assert.equal(cdnAttempts, 3);
+  assert.match(runtime.status(), /1 downloaded, 0 skipped, 0 failed/);
+});
+
+test("an existing-file probe failure cannot overwrite a possibly existing download", async () => {
+  let writableCalls = 0;
+  class ProtectedDirectory extends MemoryDirectory {
+    async getDirectoryHandle(name, options = {}) {
+      let directory = this.directories.get(name);
+      if (!directory && options.create) {
+        directory = new ProtectedDirectory(name);
+        this.directories.set(name, directory);
+      }
+      if (!directory) return super.getDirectoryHandle(name, options);
+      return directory;
+    }
+
+    async getFileHandle(name, options = {}) {
+      if (name.endsWith(".mp3")) {
+        return {
+          getFile: async () => {
+            const error = new Error("mock permission denied");
+            error.name = "NotAllowedError";
+            throw error;
+          },
+          createWritable: async () => {
+            writableCalls++;
+            throw new Error("must not open a writable after an ambiguous probe failure");
+          },
+        };
+      }
+      return super.getFileHandle(name, options);
+    }
+  }
+  const directory = new ProtectedDirectory().seed("suno-cache.json", completeCache([
+    { id: "protected001", title: "Protected" },
+  ]));
+  const runtime = createRuntime({ directory });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "probe-failure test did not finish");
+  assert.match(runtime.status(), /1 failed/);
+  assert.equal(writableCalls, 0);
+  assert.equal(runtime.calls.some((call) => call.url.startsWith("https://cdn1.suno.ai/")), false);
+});
+
 test("MIDI drum instruments use channel 10 and melodic instruments avoid it", async () => {
   const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
     { id: "midi00000001", title: "MIDI channels" },
@@ -599,6 +806,34 @@ test("MIDI drum instruments use channel 10 and melodic instruments avoid it", as
   assert.ok(bytes.some((byte, index) => byte === 0x90 && bytes[index + 1] === 60), "melodic note-on was not on a non-drum channel");
 });
 
+test("malformed MIDI note data fails instead of writing a corrupt file", async () => {
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "badmidi00001", title: "Bad MIDI" },
+  ]));
+  const runtime = createRuntime({
+    directory,
+    fetch: async (url) => {
+      url = String(url);
+      runtime.calls.push({ url });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 1 });
+      if (url.includes("/api/gen/badmidi00001/midi/")) return jsonResponse({
+        state: "complete",
+        instruments: [{ name: "Piano", is_drum: false, notes: [
+          { pitch: 60, start: "not-a-time", end: 1, velocity: 0.8 },
+        ] }],
+      });
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-mp3").checked = false;
+  runtime.element("suno-dl-midi").checked = true;
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "malformed MIDI test did not finish");
+  assert.match(runtime.status(), /1 failed/);
+  assert.equal(directory.paths().some((name) => name.endsWith(".mid")), false);
+});
+
 test("fallback downloads disambiguate duplicate song titles", async () => {
   const runtime = createRuntime({
     usePicker: false,
@@ -608,6 +843,8 @@ test("fallback downloads disambiguate duplicate song titles", async () => {
     ],
   });
   runtime.run();
+  assert.equal(runtime.element("suno-dl-pick").disabled, true);
+  assert.match(runtime.element("suno-dl-pick").textContent, /browser downloads/i);
   runtime.element("suno-dl-btn").click();
   await waitFor(() => /^Done\./.test(runtime.status()), "fallback download did not finish", 3000);
   assert.equal(runtime.document.downloads.length, 2);

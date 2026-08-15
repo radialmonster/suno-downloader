@@ -33,7 +33,22 @@
 void (async () => {
   const INSTANCE_KEY = "__sunoBulkDownloaderInstance";
   const previousInstance = window[INSTANCE_KEY];
-  if (previousInstance && typeof previousInstance.destroy === "function") await previousInstance.destroy();
+  // Publish a pending replacement before yielding. If the script is pasted
+  // several times while an old write is settling, each paste cancels and waits
+  // for its predecessor, so only the newest invocation can initialize.
+  if (previousInstance && typeof previousInstance.destroy === "function") {
+    let replacementCancelled = false;
+    const predecessorDone = Promise.resolve(previousInstance.destroy());
+    const pendingInstance = {
+      async destroy() {
+        replacementCancelled = true;
+        await predecessorDone;
+      },
+    };
+    window[INSTANCE_KEY] = pendingInstance;
+    await predecessorDone;
+    if (replacementCancelled || window[INSTANCE_KEY] !== pendingInstance) return;
+  }
   document.getElementById("suno-bulk-downloader-panel")?.remove();
 
   const FORMAT = "mp3"; // 'mp3', 'wav', or 'both'
@@ -172,9 +187,19 @@ void (async () => {
         requestController.abort();
       }, 30000);
       try {
+        const authStopped = new Promise((_, reject) => {
+          const rejectOnAbort = () => {
+            const error = new Error("authentication request aborted");
+            error.name = "AbortError";
+            reject(error);
+          };
+          requestController.signal.addEventListener("abort", rejectOnAbort, { once: true });
+          if (requestController.signal.aborted) rejectOnAbort();
+        });
+        const requestHeaders = await Promise.race([headers(refreshToken), authStopped]);
         res = await fetch(API + p, {
           method,
-          headers: await headers(refreshToken),
+          headers: requestHeaders,
           body: body ? JSON.stringify(body) : undefined,
           signal: requestController.signal,
         });
@@ -415,11 +440,12 @@ void (async () => {
     }
   }
   async function saveToFolder(dir, name, blob) {
-    if (destroyed) throw new Error("downloader instance was replaced");
-    const handle = await dir.getFileHandle(name, { create: true });
     const write = (async () => {
       let w = null;
       try {
+        if (destroyed) throw new Error("downloader instance was replaced");
+        const handle = await dir.getFileHandle(name, { create: true });
+        if (destroyed) throw new Error("downloader instance was replaced");
         w = await handle.createWritable();
         await w.write(blob);
         await w.close();
@@ -437,7 +463,13 @@ void (async () => {
     try {
       const handle = await dir.getFileHandle(name);
       return (await handle.getFile()).size > 0;
-    } catch { return false; }
+    } catch (err) {
+      // Only an absent file is safe to treat as downloadable. Permission and
+      // I/O errors may refer to an existing file; continuing with create:true
+      // could truncate it when createWritable() is opened.
+      if (err?.name === "NotFoundError") return false;
+      throw new Error("could not check existing file '" + name + "': " + (err?.message || err));
+    }
   }
 
   function saveViaDownload(name, blob) {
@@ -453,26 +485,46 @@ void (async () => {
 
   async function fetchBlob(url) {
     const signal = operationController?.signal || instanceController.signal;
-    const requestController = new AbortController();
-    const abortRequest = () => requestController.abort();
-    signal.addEventListener("abort", abortRequest, { once: true });
-    if (signal.aborted) abortRequest();
-    const timeout = setTimeout(() => requestController.abort(), 60000);
-    try {
-      const res = await fetch(url, { signal: requestController.signal });
-      if (!res.ok) throw new Error("HTTP " + res.status + " while fetching " + url);
-      const blob = await res.blob();
-      const expected = Number(res.headers.get("content-length"));
-      const contentType = (res.headers.get("content-type") || "").toLowerCase();
-      if (!blob.size || (Number.isFinite(expected) && expected > 0 && blob.size !== expected))
-        throw new Error("incomplete response while fetching " + url);
-      if (/^(text\/|application\/(?:json|xml))/.test(contentType))
-        throw new Error("unexpected " + contentType + " response while fetching " + url);
-      return blob;
-    } finally {
-      clearTimeout(timeout);
-      signal.removeEventListener("abort", abortRequest);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const requestController = new AbortController();
+      const abortRequest = () => requestController.abort();
+      signal.addEventListener("abort", abortRequest, { once: true });
+      if (signal.aborted) abortRequest();
+      let timedOut = false;
+      const timeout = setTimeout(() => { timedOut = true; requestController.abort(); }, 60000);
+      try {
+        const res = await fetch(url, { signal: requestController.signal });
+        if (!res.ok) {
+          const error = new Error("HTTP " + res.status + " while fetching " + url);
+          error.retryable = res.status === 429 || (res.status >= 500 && res.status <= 599);
+          throw error;
+        }
+        const blob = await res.blob();
+        const expected = Number(res.headers.get("content-length"));
+        const contentType = (res.headers.get("content-type") || "").toLowerCase();
+        if (!blob.size || (Number.isFinite(expected) && expected > 0 && blob.size !== expected))
+          throw new Error("incomplete response while fetching " + url);
+        if (/^(text\/|application\/(?:json|xml))/.test(contentType)) {
+          const error = new Error("unexpected " + contentType + " response while fetching " + url);
+          error.retryable = false;
+          throw error;
+        }
+        return blob;
+      } catch (err) {
+        if (destroyed || stopRequested || signal.aborted)
+          throw new Error("download stopped");
+        if (attempt >= 2 || err?.retryable === false) throw err;
+        const wait = 1000 * Math.pow(2, attempt);
+        setStatus((timedOut ? "Download timed out" : "Download failed") +
+          " - retrying in " + (wait / 1000) + "s...");
+        await stopSleep(wait);
+        if (destroyed || stopRequested || signal.aborted) throw new Error("download stopped");
+      } finally {
+        clearTimeout(timeout);
+        signal.removeEventListener("abort", abortRequest);
+      }
     }
+    throw new Error("download failed after retries");
   }
 
   async function getWavUrl(id) {
@@ -484,7 +536,12 @@ void (async () => {
     // Never automatically resubmit it. One retry remains available only for the
     // explicit 401 path, which is known not to have run the conversion.
     r = await api("POST", `/api/gen/${id}/convert_wav/`, null, 1, { retryAmbiguous: false });
-    if (r.status < 200 || r.status >= 300) throw new Error("convert_wav " + r.status + ": " + (r.j?.raw || r.j?.detail || "unexpected response"));
+    // A network failure or 5xx may happen after the paid request reached Suno.
+    // Poll the read-only result endpoint in that ambiguous case, but never risk
+    // a second conversion POST. Explicit 4xx responses are safe to surface.
+    const ambiguous = r.status === 0 || (r.status >= 500 && r.status <= 599);
+    if (!ambiguous && (r.status < 200 || r.status >= 300))
+      throw new Error("convert_wav " + r.status + ": " + (r.j?.raw || r.j?.detail || "unexpected response"));
     for (let n = 0; n < 60; n++) {
       await stopSleep(5000);
       if (stopRequested) throw new Error("wav conversion stopped");
@@ -492,7 +549,9 @@ void (async () => {
       if (r.status === 200 && r.j && r.j.wav_file_url) return r.j.wav_file_url;
       if (r.status !== 200 && r.status !== 404) throw new Error("wav_file " + r.status);
     }
-    throw new Error("wav conversion timed out");
+    throw new Error(ambiguous
+      ? "WAV conversion result is still unknown after an ambiguous request; it was not resubmitted"
+      : "wav conversion timed out");
   }
 
   // MIDI: GET /api/gen/{id}/midi/ returns {"state":"running"} then
@@ -524,7 +583,9 @@ void (async () => {
     const ins = data.instruments || [];
     let melodicChannel = 0;
     for (const instrument of ins) {
-      const notes = instrument.notes || [];
+      if (!instrument || typeof instrument !== "object" || !Array.isArray(instrument.notes))
+        throw new Error("midi response contains an invalid instrument");
+      const notes = instrument.notes;
       let channel;
       if (instrument.is_drum) channel = 9; // General MIDI percussion channel 10
       else {
@@ -532,10 +593,21 @@ void (async () => {
         if (channel >= 9) channel++;
       }
       for (const n of notes) {
-        const vel = Math.max(1, Math.min(127, Math.round((n.velocity ?? 0.7) * 127)));
-        const pitch = Math.max(0, Math.min(127, Math.round(Number.isFinite(n.pitch) ? n.pitch : 60)));
-        const onT = Math.max(0, Math.round((n.start ?? 0) * ticksPerSec));
-        const offT = Math.max(onT + 1, Math.round((n.end ?? n.start ?? 0) * ticksPerSec));
+        if (!n || typeof n !== "object") throw new Error("midi response contains an invalid note");
+        const velocityValue = Number(n.velocity ?? 0.7);
+        const pitchValue = Number(n.pitch ?? 60);
+        const startValue = Number(n.start ?? 0);
+        const endValue = Number(n.end ?? n.start ?? 0);
+        if (![velocityValue, pitchValue, startValue, endValue].every(Number.isFinite))
+          throw new Error("midi response contains non-numeric note data");
+        const vel = Math.max(1, Math.min(127, Math.round(velocityValue * 127)));
+        const pitch = Math.max(0, Math.min(127, Math.round(pitchValue)));
+        const onT = Math.max(0, Math.round(startValue * ticksPerSec));
+        const offT = Math.max(onT + 1, Math.round(endValue * ticksPerSec));
+        // Standard MIDI variable-length quantities hold at most 28 bits. A
+        // changed/malformed API response must fail rather than wrap its timing.
+        if (onT > 0x0fffffff || offT > 0x0fffffff)
+          throw new Error("midi response note time is out of range");
         events.push([onT, [0x90 | channel, pitch, vel]]);
         events.push([offT, [0x80 | channel, pitch, 0]]);
       }
@@ -758,10 +830,16 @@ void (async () => {
       const cached = JSON.parse(text);
       if (!cached || typeof cached !== "object" || Array.isArray(cached))
         throw new Error("cache root is not an object");
-      if (cached.songs !== undefined && !Array.isArray(cached.songs))
+      if (!Array.isArray(cached.songs))
         throw new Error("cache songs field is not an array");
       if (cached.seenIds !== undefined && !Array.isArray(cached.seenIds))
         throw new Error("cache seenIds field is not an array");
+      if (cached.libDone !== undefined && typeof cached.libDone !== "boolean")
+        throw new Error("cache libDone field is not a boolean");
+      if (cached.wsDone !== undefined && typeof cached.wsDone !== "boolean")
+        throw new Error("cache wsDone field is not a boolean");
+      if (cached.stemsIncluded !== undefined && typeof cached.stemsIncluded !== "boolean")
+        throw new Error("cache stemsIncluded field is not a boolean");
       if ((cached.songs || []).some((song) => !song || typeof song !== "object" || typeof song.id !== "string"))
         throw new Error("cache contains an invalid song entry");
       if ((cached.seenIds || []).some((id) => typeof id !== "string"))
@@ -837,7 +915,10 @@ void (async () => {
 
   async function enumerateSongs(dir) {
     setStatus("Enumerating songs...");
-    scanState.stemsIncluded = scanState.stemsIncluded || includeStems();
+    // This flag means every page contributing to a completed cache included
+    // stems. Resuming a partial stem scan with stems disabled must downgrade it;
+    // otherwise a later stem run would trust an incomplete stem collection.
+    scanState.stemsIncluded = includeStems();
     const onProgress = (msg) => setStatus(msg);
     const scans = await Promise.allSettled([
       getLibrary(dir, onProgress, persistCache),
@@ -854,6 +935,11 @@ void (async () => {
 
   // ---------- flow ----------
   const usePicker = typeof window.showDirectoryPicker === "function";
+  if (!usePicker) {
+    pickBtn.disabled = true;
+    pickBtn.textContent = "Folder picker unavailable (browser downloads)";
+    setStatus("Files will use your browser's normal download behavior.");
+  }
   let songs = [];
   let rescan = false;
   let pickedDir = null;
@@ -921,7 +1007,7 @@ void (async () => {
     busy = isBusy;
     startBtn.disabled = isBusy;
     stopBtn.disabled = !isBusy;
-    pickBtn.disabled = isBusy;
+    pickBtn.disabled = isBusy || !usePicker;
     for (const cb of [mp3Check, wavCheck, midiCheck, stemsCheck]) cb.disabled = isBusy;
     if (rescanLink) {
       rescanLink.setAttribute("aria-disabled", String(isBusy));
