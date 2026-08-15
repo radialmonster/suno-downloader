@@ -6,7 +6,7 @@ Download all your songs from Suno as MP3, WAV, and MIDI with one paste into the 
 
 - **Downloads your full Suno library + workspace** (auto-detected via Suno's own feed)
 - **MP3 and/or WAV and/or MIDI** — tick whichever you want (WAV/MIDI use Suno's converters, so they're slower per song)
-- **Stems support** — optionally download your already-generated stems into each song's `stems/` folder (`Vocals.mp3`, `Drums.mp3`, ...); repeated names get stable clip-ID suffixes as needed so none overwrite each other or change names on later re-scans
+- **Stems support** — optionally download your already-generated stems as MP3s into each song's `stems/` folder (`Vocals.mp3`, `Drums.mp3`, ...), regardless of the full-song format selection; repeated names get stable clip-ID suffixes as needed so none overwrite each other or change names on later re-scans
 - **Section-edit clips grouped** — Suno's "replace section" variations (e.g. `[01:55.0 - 02:18.4] {verse]`) are filed under their parent song's `variations/` folder
 - **Per-song folders** — one unique folder per song (`<title> [<id>]/`), so duplicate titles never collide; unsafe or overlong filename characters are normalized for portability (with the Chrome/Edge folder picker)
 - **Resumable folder downloads** — stop any time and rerun to continue where you left off; already-downloaded files are skipped
@@ -41,7 +41,7 @@ Download all your songs from Suno as MP3, WAV, and MIDI with one paste into the 
 
 9. Click **Start**.
 
-> Chrome or Edge is required for the folder picker, per-song folders, cache, and automatic resume/skip behavior. On Firefox/Safari it falls back to normal per-file downloads. The script disambiguates clips found in the same scan, but reruns cannot inspect or skip prior downloads, so the browser controls any repeat-download suffixes.
+> Chrome or Edge is required for the folder picker, per-song folders, cache, and automatic resume/skip behavior. On Firefox/Safari it falls back to normal per-file downloads with stable clip-ID suffixes. Reruns cannot inspect or skip prior downloads, so the browser controls any repeat-download suffixes.
 
 ## What you get
 

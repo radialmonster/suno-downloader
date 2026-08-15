@@ -331,6 +331,82 @@ test("re-paste aborts an old in-flight scan before it can overlap", async () => 
   assert.equal(runtime.document.querySelectorAll("#suno-bulk-downloader-panel").length, 1);
 });
 
+test("re-paste prevents a stale fallback download when response body reading ignores abort", async () => {
+  let releaseBlob;
+  let bodyReadStarted = false;
+  const blobGate = new Promise((resolve) => { releaseBlob = resolve; });
+  const runtime = createRuntime({
+    usePicker: false,
+    libraryClips: [{ id: "stalebody001", title: "Stale body", status: "complete", metadata: {} }],
+    fetch: async (url, init = {}) => {
+      url = String(url);
+      runtime.calls.push({ url, init });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 1 });
+      if (url.endsWith("/api/feed/v3")) return jsonResponse({
+        clips: [{ id: "stalebody001", title: "Stale body", status: "complete", metadata: {} }],
+        next_cursor: null,
+      });
+      if (url.includes("/api/project/feed")) return jsonResponse({ items: [], next_cursor: null });
+      if (url.startsWith("https://cdn1.suno.ai/")) return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-type": "audio/mpeg" }),
+        blob: async () => {
+          bodyReadStarted = true;
+          await blobGate;
+          return new Blob([MP3_BYTES]);
+        },
+      };
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => bodyReadStarted, "fallback response body read did not start");
+  runtime.run();
+  releaseBlob();
+  await waitFor(() => runtime.document.querySelectorAll("#suno-bulk-downloader-panel").length === 1,
+    "replacement panel did not initialize after the stale response settled");
+  assert.deepEqual(runtime.document.downloads, [], "destroyed instance triggered a stale browser download");
+});
+
+test("Stop prevents a stale fallback download when response body reading ignores abort", async () => {
+  let releaseBlob;
+  let bodyReadStarted = false;
+  const blobGate = new Promise((resolve) => { releaseBlob = resolve; });
+  const runtime = createRuntime({
+    usePicker: false,
+    fetch: async (url, init = {}) => {
+      url = String(url);
+      runtime.calls.push({ url, init });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 1 });
+      if (url.endsWith("/api/feed/v3")) return jsonResponse({
+        clips: [{ id: "stoppedbody1", title: "Stopped body", status: "complete", metadata: {} }],
+        next_cursor: null,
+      });
+      if (url.includes("/api/project/feed")) return jsonResponse({ items: [], next_cursor: null });
+      if (url.startsWith("https://cdn1.suno.ai/")) return {
+        ok: true,
+        status: 200,
+        headers: new Headers({ "content-type": "audio/mpeg" }),
+        blob: async () => {
+          bodyReadStarted = true;
+          await blobGate;
+          return new Blob([MP3_BYTES]);
+        },
+      };
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => bodyReadStarted, "fallback response body read did not start");
+  runtime.document.walk().find((element) => element.textContent === "Stop").click();
+  releaseBlob();
+  await waitFor(() => /^Stopped\./.test(runtime.status()), "stopped fallback download did not finish");
+  assert.deepEqual(runtime.document.downloads, [], "stopped operation triggered a stale browser download");
+});
+
 test("re-paste waits for an old in-flight file write before initializing", async () => {
   let releaseClose;
   let writeStarted = false;
@@ -962,6 +1038,20 @@ test("non-ASCII output components stay within portable filesystem limits", async
   }
 });
 
+test("Windows superscript device names are escaped before creating output paths", async () => {
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "reserved0001", title: "COM¹" },
+    { id: "reserved0002", title: "LPT²" },
+  ]));
+  const runtime = createRuntime({ directory });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "reserved-name download did not finish", 3000);
+  const paths = directory.paths();
+  assert.ok(paths.some((name) => name.includes("/_COM¹.mp3")));
+  assert.ok(paths.some((name) => name.includes("/_LPT².mp3")));
+});
+
 test("feed requests use current parameters and paginate from next_cursor without has_more", async () => {
   let libraryPage = 0;
   let workspacePage = 0;
@@ -1514,6 +1604,25 @@ test("fallback downloads disambiguate duplicate song titles", async () => {
   assert.equal(new Set(runtime.document.downloads.map((name) => name.toLowerCase())).size, 2);
 });
 
+test("fallback song names cannot collide with synthesized stem names", async () => {
+  const runtime = createRuntime({
+    usePicker: false,
+    libraryClips: [
+      { id: "parent000001", title: "Parent", status: "complete", metadata: {} },
+      { id: "stem0000001", title: "Vocals", status: "complete",
+        metadata: { stem_from_id: "parent000001", stem_type_group_name: "Vocals" } },
+      { id: "song00000001", title: "Parent - Vocals [stem0000]", status: "complete", metadata: {} },
+    ],
+  });
+  runtime.run();
+  runtime.element("suno-dl-stems").checked = true;
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "fallback collision test did not finish", 3000);
+  const keys = runtime.document.downloads.map((name) => name.normalize("NFC").toLowerCase());
+  assert.equal(keys.length, 3);
+  assert.equal(new Set(keys).size, keys.length);
+});
+
 test("fallback duplicate stems get one stable clip ID suffix apiece", async () => {
   const runtime = createRuntime({
     usePicker: false,
@@ -1534,6 +1643,23 @@ test("fallback duplicate stems get one stable clip ID suffix apiece", async () =
     "Parent - Vocals [stem0000002].mp3",
     "Parent - Vocals [stem0000001].mp3",
   ].sort());
+});
+
+test("Include stems downloads existing stem MP3s even when the song format is WAV", async () => {
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "existingstem1", title: "Vocals", isStem: true, parentId: "missingparent", stemName: "Vocals" },
+  ], { stemsIncluded: true }));
+  const runtime = createRuntime({ directory });
+  runtime.run();
+  runtime.element("suno-dl-mp3").checked = false;
+  runtime.element("suno-dl-wav").checked = true;
+  runtime.element("suno-dl-stems").checked = true;
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "existing stem download did not finish", 3000);
+  assert.ok(directory.paths().some((name) => name.endsWith("/stems/Vocals.mp3")));
+  assert.equal(runtime.calls.some((call) => /\/api\/gen\//.test(call.url)), false,
+    "downloading an existing stem invoked a conversion endpoint");
+  assert.match(runtime.status(), /1 downloaded, 0 skipped, 0 failed/);
 });
 
 test("case-insensitive ID suffix collisions cannot merge song folders", async () => {

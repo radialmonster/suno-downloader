@@ -96,7 +96,7 @@ void (async () => {
     if (!clean) clean = "untitled";
     // Windows rejects these basenames even with an extension. Keep ordinary
     // legacy names unchanged, but make unsafe names portable across platforms.
-    if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(clean)) clean = "_" + clean;
+    if (/^(con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/i.test(clean)) clean = "_" + clean;
     // Native component limits are measured in UTF-8 bytes on common Unix/macOS
     // filesystems and UTF-16 code units on Windows. A code-point-only cap lets
     // emoji/CJK titles exceed both limits even though an ASCII title is safe.
@@ -601,6 +601,8 @@ void (async () => {
   }
 
   function saveViaDownload(name, blob) {
+    if (destroyed || stopRequested || operationController?.signal.aborted || instanceController.signal.aborted)
+      throw new Error("download stopped");
     const a = document.createElement("a");
     const href = URL.createObjectURL(blob);
     a.href = href;
@@ -743,6 +745,10 @@ void (async () => {
           error.retryable = false;
           throw error;
         }
+        // A response implementation may ignore AbortSignal while reading or
+        // validating its body. Re-check immediately before handing bytes to the
+        // save path so Stop/re-paste cannot trigger a stale browser download.
+        if (destroyed || stopRequested || signal.aborted) throw new Error("download stopped");
         return blob;
       } catch (err) {
         if (destroyed || stopRequested || signal.aborted)
@@ -1135,7 +1141,10 @@ void (async () => {
     if (isStem) {
       const parentEntry = scanState.songs.get(parentId);
       const fname = stemFileBase(entry);
-      if (fmt.mp3) {
+      // The stem option refers to existing stem audio, whose feed URL is MP3.
+      // Honor it independently of the formats selected for full songs; this
+      // never calls a stem-generation or conversion endpoint.
+      if (operationOptions?.includeStems ?? includeStems()) {
         if (dir) {
           const parentFolder = await getOrCreateSubDir(dir, parentEntry ? folderFor(parentEntry) : orphanParentFolder(entry));
           const stemsDir = await getOrCreateSubDir(parentFolder, "stems");
@@ -1171,11 +1180,11 @@ void (async () => {
       return out;
     }
     const songDir = await getOrCreateSubDir(dir, folderFor(entry));
-    const sameTitleSongs = [...scanState.songs.values()].filter((candidate) =>
-      !candidate.isStem && !candidate.isInfill && collisionKey(candidate.title) === collisionKey(title)
-    );
-    const fallbackBase = sameTitleSongs.length > 1
-      ? withSuffix(clean, " [" + collisionSafeId(entry, sameTitleSongs) + "]") : clean;
+    // Browser-download mode has one flat namespace. Always suffix normal songs,
+    // otherwise a literal song title can collide with a synthesized stem or
+    // variation name from the same scan.
+    const fallbackBase = withSuffix(clean, " [" +
+      collisionSafeId(entry, [...scanState.songs.values()]) + "]");
     if (fmt.mp3) {
       if (dir && await existsInFolder(songDir, clean + ".mp3")) out.files.push("mp3:skip");
       else if (!dir) {
@@ -1363,7 +1372,7 @@ void (async () => {
       if (LIMIT > 0) songs = songs.slice(0, LIMIT);
       songsDir = dir;
       songsIncludedStems = wantsStems;
-      setStatus(`Using cache: ${songs.length} download items.\nPress Start to download.`);
+      setStatus(`Using cache: ${songs.length} download items.\nStarting download...`);
       return true;
     }
     stopRequested = false;
@@ -1387,7 +1396,7 @@ void (async () => {
     songsDir = dir;
     songsIncludedStems = wantsStems;
     if (!songs.length) { setStatus("No songs found."); return false; }
-    setStatus(`Found ${songs.length} download items${includeStems() ? " (songs and stems)" : ""}.\nPress Start to download.`);
+    setStatus(`Found ${songs.length} download items${includeStems() ? " (songs and stems)" : ""}.\nStarting download...`);
     return true;
   }
 
