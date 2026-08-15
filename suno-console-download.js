@@ -9,7 +9,9 @@
  *     <title> [id8]/           one unique folder per song (id disambiguates dupes)
  *       <title>.mp3            MP3 download
  *       <title>.wav            WAV download
+ *       <title>.mid            MIDI download
  *       stems/                 (when stems enabled) Vocals.mp3, Drums.mp3, ...
+ *       variations/            section-edit clips
  *     suno-cache.json          scan cache (auto-created)
  *
  * Usage:
@@ -17,7 +19,7 @@
  *   2. Open DevTools (F12) and switch to the Console tab.
  *   3. Adjust FORMAT / LIMIT / INCLUDE below if you want.
  *   4. Paste this whole script and press Enter.
- *   5. A panel appears - click "Choose folder...", pick where to save, done.
+ *   5. In the panel, choose formats/folder and click "Start".
  *
  * By default it downloads only full songs (stems are excluded automatically).
  * Set INCLUDE_STEMS = true to also download already-generated stems - these are
@@ -51,7 +53,7 @@ void (async () => {
   }
   document.getElementById("suno-bulk-downloader-panel")?.remove();
 
-  const FORMAT = "mp3"; // 'mp3', 'wav', or 'both'
+  const FORMAT = "mp3"; // default checkbox preset: 'mp3', 'wav', or 'both' (MIDI is selected in the panel)
   const LIMIT = 0; // 0 = all songs, or N = first N songs
   const INCLUDE_LIBRARY = true; // your Suno library (created + liked songs)
   const INCLUDE_WORKSPACE = true; // your workspace (drafts/in-progress)
@@ -111,6 +113,15 @@ void (async () => {
   // in-flight filesystem mutation here so a replacement instance waits for the
   // old one to become completely quiescent before it starts using the folder.
   const activeFileWrites = new Set();
+  // Includes picker waits and read-only probes as well as scans/downloads. A
+  // replacement instance waits for these handlers to settle, so an old pasted
+  // copy cannot remain alive behind the new panel.
+  const activeTasks = new Set();
+  const trackTask = (task) => {
+    activeTasks.add(task);
+    task.then(() => activeTasks.delete(task), () => activeTasks.delete(task));
+    return task;
+  };
   const panel = document.createElement("div");
   panel.id = "suno-bulk-downloader-panel";
   Object.assign(panel.style, {
@@ -163,6 +174,7 @@ void (async () => {
       operationController?.abort();
       instanceController.abort();
       panel.remove();
+      await Promise.allSettled([...activeTasks]);
       // File System Access mutations cannot take an AbortSignal. Waiting for
       // the small set already in flight prevents a replacement instance from
       // creating directories or writing the same file concurrently.
@@ -178,7 +190,7 @@ void (async () => {
     const refreshId = ++creditRefreshId;
     const fmt = getFormats();
     let line = "";
-    const apiCredits = await api("GET", "/api/billing/credits", null, 1);
+    const apiCredits = await api("GET", "/api/billing/credits", null, 1, { reportStatus: false });
     const balance = apiCredits.status === 200 && apiCredits.j && typeof apiCredits.j.total_credits_left === "number"
       ? apiCredits.j.total_credits_left : null;
     if (balance !== null) {
@@ -202,7 +214,7 @@ void (async () => {
     return { Authorization: "Bearer " + token, "Content-Type": "application/json" };
   };
   const api = async (method, p, body, retries = 5, options = {}) => {
-    const { retryAmbiguous = true } = options;
+    const { retryAmbiguous = true, reportStatus = true } = options;
     let refreshToken = false;
     for (let i = 0; i <= retries; i++) {
       const signal = operationController?.signal || instanceController.signal;
@@ -243,7 +255,7 @@ void (async () => {
           return { status: 0, j: { raw: (timedOut ? "request timed out" : "network request failed") + " after retries: " + (err?.message || err) } };
         }
         const wait = Math.min(1000 * Math.pow(2, i), 30000);
-        setStatus("Network error - retrying in " + (wait / 1000) + "s...");
+        if (reportStatus) setStatus("Network error - retrying in " + (wait / 1000) + "s...");
         await stopSleep(wait);
         if (stopRequested) return { status: 0, j: { raw: "request stopped" } };
         continue;
@@ -259,7 +271,7 @@ void (async () => {
         clearTimeout(timeout);
         signal.removeEventListener("abort", abortRequest);
         const wait = Math.min(2000 * Math.pow(2, i), 60000); // exponential: 2s,4s,8s,... max 60s
-        setStatus("Rate limited - waiting " + (wait / 1000) + "s...");
+        if (reportStatus) setStatus("Rate limited - waiting " + (wait / 1000) + "s...");
         await stopSleep(wait);
         if (destroyed || stopRequested || signal.aborted)
           return { status: 0, j: { raw: "request stopped" } };
@@ -269,7 +281,7 @@ void (async () => {
         clearTimeout(timeout);
         signal.removeEventListener("abort", abortRequest);
         const wait = Math.min(1000 * Math.pow(2, i), 30000);
-        setStatus("Server error " + res.status + " - retrying in " + (wait / 1000) + "s...");
+        if (reportStatus) setStatus("Server error " + res.status + " - retrying in " + (wait / 1000) + "s...");
         await stopSleep(wait);
         if (destroyed || stopRequested || signal.aborted)
           return { status: 0, j: { raw: "request stopped" } };
@@ -286,7 +298,7 @@ void (async () => {
         if (!retryAmbiguous || i >= retries)
           return { status: 0, j: { raw: (timedOut ? "response timed out" : "response body failed") + " after retries: " + (err?.message || err) } };
         const wait = Math.min(1000 * Math.pow(2, i), 30000);
-        setStatus("Network error - retrying in " + (wait / 1000) + "s...");
+        if (reportStatus) setStatus("Network error - retrying in " + (wait / 1000) + "s...");
         await stopSleep(wait);
         continue;
       }
@@ -401,6 +413,24 @@ void (async () => {
     try { return JSON.stringify(cursor); } catch { return String(cursor); }
   };
 
+  const responseCursor = (body, feedName) => {
+    if (!Object.prototype.hasOwnProperty.call(body || {}, "next_cursor"))
+      throw new Error(feedName + " feed error: response is missing next_cursor");
+    const next = body.next_cursor;
+    const valid = next === null || (typeof next === "string" && next.length > 0) ||
+      (next && typeof next === "object" && !Array.isArray(next));
+    if (!valid) throw new Error(feedName + " feed error: invalid next_cursor");
+    if (body.has_more !== undefined) {
+      if (typeof body.has_more !== "boolean")
+        throw new Error(feedName + " feed error: has_more is not a boolean");
+      if (body.has_more !== (next !== null))
+        throw new Error(feedName + " feed error: has_more contradicts next_cursor");
+    }
+    return next;
+  };
+
+  const queryCursor = (cursor) => typeof cursor === "string" ? cursor : JSON.stringify(cursor);
+
   async function getLibrary(dir, onProgress, persist) {
     if (!INCLUDE_LIBRARY || scanState.libDone) return;
     let cursor = scanState.libCursor;
@@ -412,13 +442,13 @@ void (async () => {
       if (page > MAX_SCAN_PAGES) throw new Error("library feed exceeded the pagination safety limit");
       requestedCursors.add(cursorKey(cursor));
       progress("Scanning library", page);
-      const r = await api("POST", "/api/feed/v3", { n: 50, p: null, client_type: "web", cursor });
+      const r = await api("POST", "/api/feed/v3", { cursor, limit: 50, filters: {} });
       if (r.status !== 200 && (stopRequested || destroyed)) return;
       if (r.status !== 200)
         throw new Error("library feed error " + r.status + ": " + (r.j?.raw || r.j?.detail || "unexpected response"));
-      if (!Array.isArray(r.j?.clips) || typeof r.j.has_more !== "boolean" ||
-          (r.j.has_more && (r.j.next_cursor === null || r.j.next_cursor === undefined)))
+      if (!Array.isArray(r.j?.clips))
         throw new Error("library feed error: unexpected response shape");
+      const nextCursor = responseCursor(r.j, "library");
       const clips = r.j.clips;
       scanState.scanned += clips.length;
       let known = 0;
@@ -427,10 +457,17 @@ void (async () => {
           throw new Error("library feed error: invalid clip entry");
         if (earlyStopLibrary && knownBeforeRescan.has(c.id)) known++;
         scanState.seenIds.add(c.id);
-        if (c.status === "complete" && (includeStems() || !isStem(c)))
-          scanState.songs.set(c.id, toEntry(c));
+        if (c.status === "complete" && (includeStems() || !isStem(c))) {
+          const entry = toEntry(c);
+          const previous = scanState.songs.get(c.id);
+          if (entry.isStem && previous?.stemOutputBase)
+            entry.stemOutputBase = previous.stemOutputBase;
+          if (entry.isInfill && previous?.variationOutputBase)
+            entry.variationOutputBase = previous.variationOutputBase;
+          scanState.songs.set(c.id, entry);
+        }
       }
-      cursor = r.j.has_more ? r.j.next_cursor : null;
+      cursor = nextCursor;
       if (cursor && requestedCursors.has(cursorKey(cursor)))
         throw new Error("library feed pagination cursor did not advance");
       scanState.libCursor = cursor;
@@ -456,13 +493,15 @@ void (async () => {
       if (page > MAX_SCAN_PAGES) throw new Error("project feed exceeded the pagination safety limit");
       requestedCursors.add(cursorKey(cursor));
       progress("Scanning workspace", page);
-      const qs = cursor ? `?n=50&cursor=${encodeURIComponent(JSON.stringify(cursor))}` : "?n=50";
+      const qs = "?scope=default&limit=50" +
+        (cursor ? `&cursor=${encodeURIComponent(queryCursor(cursor))}` : "");
       const r = await api("GET", "/api/project/feed" + qs);
       if (r.status !== 200 && (stopRequested || destroyed)) return;
       if (r.status !== 200)
         throw new Error("project feed error " + r.status + ": " + (r.j?.raw || r.j?.detail || "unexpected response"));
-      if (!Array.isArray(r.j?.items) || !Object.prototype.hasOwnProperty.call(r.j, "next_cursor"))
+      if (!Array.isArray(r.j?.items))
         throw new Error("project feed error: unexpected response shape");
+      const nextCursor = responseCursor(r.j, "project");
       const items = r.j.items;
       let scannedThisPage = 0;
       let known = 0;
@@ -477,11 +516,17 @@ void (async () => {
         if (earlyStopWorkspace && knownBeforeRescan.has(c.id)) known++;
         scanState.seenIds.add(c.id);
         if (c.status === "complete" && (includeStems() || !isStem(c))) {
-          scanState.songs.set(c.id, toEntry(c));
+          const entry = toEntry(c);
+          const previous = scanState.songs.get(c.id);
+          if (entry.isStem && previous?.stemOutputBase)
+            entry.stemOutputBase = previous.stemOutputBase;
+          if (entry.isInfill && previous?.variationOutputBase)
+            entry.variationOutputBase = previous.variationOutputBase;
+          scanState.songs.set(c.id, entry);
         }
       }
       scanState.scanned += scannedThisPage;
-      cursor = r.j.next_cursor || null;
+      cursor = nextCursor;
       if (cursor && requestedCursors.has(cursorKey(cursor)))
         throw new Error("project feed pagination cursor did not advance");
       scanState.wsCursor = cursor;
@@ -557,7 +602,105 @@ void (async () => {
     setTimeout(() => URL.revokeObjectURL(href), 30000);
   }
 
-  async function fetchBlob(url) {
+  const validateMediaBlob = async (blob, contentType, kind, url) => {
+    const mime = String(contentType || "").split(";", 1)[0].trim().toLowerCase();
+    if (mime.startsWith("text/") || mime.startsWith("image/") || mime.startsWith("video/") ||
+        mime === "application/json" || mime.endsWith("+json") ||
+        mime === "application/xml" || mime.endsWith("+xml"))
+      throw new Error("unexpected " + (mime || "non-audio") + " response while fetching " + url);
+
+    // CDNs sometimes serve media as application/octet-stream or omit the MIME
+    // type, so validate the container bytes rather than requiring one exact
+    // header. This also catches a binary error/image body returned with HTTP 200.
+    const head = new Uint8Array(await blob.slice(0, Math.min(blob.size, 4096)).arrayBuffer());
+    if (kind === "wav") {
+      let container = head.length >= 12 &&
+        head[0] === 0x52 && head[1] === 0x49 && head[2] === 0x46 && head[3] === 0x46 && // RIFF
+        head[8] === 0x57 && head[9] === 0x41 && head[10] === 0x56 && head[11] === 0x45; // WAVE
+      let hasFormat = false;
+      let hasAudioData = false;
+      if (container) {
+        const declaredRiffSize = new DataView(head.buffer, head.byteOffset + 4, 4).getUint32(0, true);
+        const containerEnd = declaredRiffSize + 8;
+        if (declaredRiffSize < 4 || containerEnd > blob.size) container = false;
+        for (let offset = 12, chunks = 0; container && chunks < 256 && offset + 8 <= containerEnd; chunks++) {
+          const chunkHead = new Uint8Array(await blob.slice(offset, offset + 8).arrayBuffer());
+          const chunkId = String.fromCharCode(chunkHead[0], chunkHead[1], chunkHead[2], chunkHead[3]);
+          const size = new DataView(chunkHead.buffer, chunkHead.byteOffset + 4, 4).getUint32(0, true);
+          const dataStart = offset + 8;
+          if (chunkId === "fmt ") {
+            if (size < 16 || dataStart + size > containerEnd) break;
+            const fmt = new DataView(await blob.slice(dataStart, dataStart + 16).arrayBuffer());
+            hasFormat = fmt.getUint16(0, true) > 0 && fmt.getUint16(2, true) > 0 &&
+              fmt.getUint32(4, true) > 0 && fmt.getUint16(12, true) > 0 && fmt.getUint16(14, true) > 0;
+          } else if (chunkId === "data") {
+            const available = containerEnd - dataStart;
+            hasAudioData = size > 0 && size <= available;
+            if (hasFormat && hasAudioData) break;
+          }
+          const next = dataStart + size + (size & 1);
+          if (next <= offset || next > containerEnd) break;
+          offset = next;
+        }
+      }
+      if (!container || !hasFormat || !hasAudioData)
+        throw new Error("response is not a complete WAV file while fetching " + url);
+    } else if (kind === "mp3") {
+      const id3 = head.length >= 10 && head[0] === 0x49 && head[1] === 0x44 && head[2] === 0x33 &&
+        head[3] >= 2 && head[3] <= 4 && head[4] !== 0xff &&
+        head.slice(6, 10).every((byte) => byte < 0x80) &&
+        10 + ((head[6] << 21) | (head[7] << 14) | (head[8] << 7) | head[9]) <= blob.size;
+      const mpegFrameLength = (bytes, offset) => {
+        if (offset + 3 >= bytes.length || bytes[offset] !== 0xff || (bytes[offset + 1] & 0xe0) !== 0xe0)
+          return 0;
+        const versionBits = (bytes[offset + 1] >> 3) & 0x03;
+        const layerBits = (bytes[offset + 1] >> 1) & 0x03;
+        const bitrateIndex = (bytes[offset + 2] >> 4) & 0x0f;
+        const sampleRateIndex = (bytes[offset + 2] >> 2) & 0x03;
+        if (versionBits === 1 || layerBits === 0 || bitrateIndex === 0 || bitrateIndex === 15 || sampleRateIndex === 3)
+          return 0;
+        const version1 = versionBits === 3;
+        const bitrates = version1
+          ? (layerBits === 3
+            ? [32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448]
+            : layerBits === 2
+              ? [32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384]
+              : [32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320])
+          : (layerBits === 3
+            ? [32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256]
+            : [8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160]);
+        const baseSampleRates = [44100, 48000, 32000];
+        const sampleRate = baseSampleRates[sampleRateIndex] / (versionBits === 3 ? 1 : versionBits === 2 ? 2 : 4);
+        const bitrate = bitrates[bitrateIndex - 1] * 1000;
+        const padding = (bytes[offset + 2] >> 1) & 1;
+        if (layerBits === 3) return Math.floor((12 * bitrate / sampleRate + padding) * 4);
+        return Math.floor(((layerBits === 1 && !version1) ? 72 : 144) * bitrate / sampleRate + padding);
+      };
+      let audioOffset = 0;
+      if (id3) {
+        const tagSize = (head[6] << 21) | (head[7] << 14) | (head[8] << 7) | head[9];
+        const footerSize = head[3] === 4 && (head[5] & 0x10) ? 10 : 0;
+        audioOffset = 10 + tagSize + footerSize;
+      }
+      const audioHead = audioOffset
+        ? new Uint8Array(await blob.slice(audioOffset, Math.min(blob.size, audioOffset + 4096)).arrayBuffer())
+        : head;
+      const hasTwoFramesAt = (offset) => {
+        const length = mpegFrameLength(audioHead, offset);
+        return length > 0 && mpegFrameLength(audioHead, offset + length) > 0;
+      };
+      let frame = hasTwoFramesAt(0);
+      // When encoders put a small non-ID3 preamble before audio, require two
+      // frame headers at the exact calculated spacing. A lone sync-like pattern
+      // inside arbitrary binary is far too common to identify an MP3 safely.
+      for (let i = 1; !frame && i + 3 < audioHead.length; i++) {
+        frame = hasTwoFramesAt(i);
+      }
+      if (!frame) throw new Error("response is not an MP3 file while fetching " + url);
+    }
+  };
+
+  async function fetchBlob(url, kind) {
     const signal = operationController?.signal || instanceController.signal;
     for (let attempt = 0; attempt < 3; attempt++) {
       const requestController = new AbortController();
@@ -583,6 +726,12 @@ void (async () => {
           error.retryable = false;
           throw error;
         }
+        try {
+          await validateMediaBlob(blob, contentType, kind, url);
+        } catch (error) {
+          error.retryable = false;
+          throw error;
+        }
         return blob;
       } catch (err) {
         if (destroyed || stopRequested || signal.aborted)
@@ -605,7 +754,7 @@ void (async () => {
     const fallback = `https://cdn1.suno.ai/${entry.id}.mp3`;
     const preferred = typeof entry.audioUrl === "string" ? entry.audioUrl : fallback;
     try {
-      return await fetchBlob(preferred);
+      return await fetchBlob(preferred, "mp3");
     } catch (preferredError) {
       // Older caches have no audioUrl and continue to use the established CDN
       // convention. If a cached feed URL later expires, try that convention as
@@ -613,7 +762,7 @@ void (async () => {
       if (preferred === fallback || destroyed || stopRequested ||
           operationController?.signal.aborted || instanceController.signal.aborted)
         throw preferredError;
-      try { return await fetchBlob(fallback); } catch { throw preferredError; }
+      try { return await fetchBlob(fallback, "mp3"); } catch { throw preferredError; }
     }
   }
 
@@ -736,7 +885,17 @@ void (async () => {
         events.push([offT, [0x80 | channel, pitch, 0]]);
       }
     }
-    events.sort((a, b) => a[0] - b[0]);
+    events.sort((a, b) => {
+      const time = a[0] - b[0];
+      if (time) return time;
+      // End an existing note before starting another one at the same tick. If
+      // Suno returns notes out of order, note-on first would immediately silence
+      // the replacement note on many MIDI players.
+      const aOff = (a[1][0] & 0xf0) === 0x80;
+      const bOff = (b[1][0] & 0xf0) === 0x80;
+      if (aOff !== bOff) return aOff ? -1 : 1;
+      return a[1][0] - b[1][0] || a[1][1] - b[1][1];
+    });
     const buf = [];
     const vlq = (v) => {
       const b = [v & 0x7f];
@@ -767,10 +926,28 @@ void (async () => {
     return new Blob([new Uint8Array(buf)], { type: "audio/midi" });
   }
 
+  const collisionKey = (name) => sanitize(name).normalize("NFC").toLowerCase();
+  const idFingerprint = (value) => {
+    // Two independent 32-bit hashes keep the suffix portable and distinguish
+    // IDs that a case-insensitive filesystem considers equal.
+    let a = 0x811c9dc5;
+    let b = 0x9e3779b9;
+    for (let i = 0; i < value.length; i++) {
+      const code = value.charCodeAt(i);
+      a = Math.imul(a ^ code, 0x01000193) >>> 0;
+      b = Math.imul(b ^ code, 0x85ebca6b) >>> 0;
+    }
+    return a.toString(16).padStart(8, "0") + b.toString(16).padStart(8, "0");
+  };
   const collisionSafeId = (entry, peers) => {
-    const short = entry.id.slice(0, 8);
-    return peers.some((candidate) => candidate.id !== entry.id && candidate.id.slice(0, 8) === short)
-      ? entry.id : short;
+    const short = sanitize(entry.id.slice(0, 8));
+    const conflicts = (tokenFor) => peers.some((candidate) =>
+      candidate.id !== entry.id && collisionKey(tokenFor(candidate)) === collisionKey(tokenFor(entry))
+    );
+    if (!conflicts((candidate) => sanitize(candidate.id.slice(0, 8)))) return short;
+    const full = sanitize(entry.id);
+    if (!conflicts((candidate) => sanitize(candidate.id))) return full;
+    return truncatePortable(full, 80) + "-" + idFingerprint(entry.id);
   };
   const withSuffix = (base, suffix) => {
     // Leave room for an extension under the usual 255-byte/code-unit component
@@ -786,8 +963,6 @@ void (async () => {
       Math.max(1, 220 - tailSize.codeUnits)).replace(/[. ]+$/g, "") || "untitled";
     return head + tail;
   };
-  const collisionKey = (name) => sanitize(name).normalize("NFC").toLowerCase();
-
   // Preserve the established "<title> [<id8>]" layout unless two clips really
   // share that output path, in which case the full IDs prevent an overwrite.
   const folderFor = (entry) => {
@@ -803,6 +978,7 @@ void (async () => {
   // the friendly name when unique, and disambiguate every member of a duplicate
   // set so reruns map each clip to the same file instead of silently skipping it.
   const stemFileBase = (entry) => {
+    if (entry.stemOutputBase) return sanitize(entry.stemOutputBase);
     const base = sanitize(entry.stemName || entry.title);
     const key = collisionKey(entry.stemName || entry.title);
     const duplicates = [...scanState.songs.values()].filter((candidate) =>
@@ -814,7 +990,58 @@ void (async () => {
       ? withSuffix(base, " [" + collisionSafeId(entry, duplicates) + "]") : base;
   };
 
+  function assignStableBases(entries, outputField, rawName, kind) {
+    const groups = new Map();
+    const usedByParent = new Map();
+    for (const entry of entries) {
+      const parentKey = String(entry.parentId || "");
+      if (!usedByParent.has(parentKey)) usedByParent.set(parentKey, new Map());
+      if (entry[outputField]) {
+        entry[outputField] = sanitize(entry[outputField]);
+        const key = collisionKey(entry[outputField]);
+        const used = usedByParent.get(parentKey);
+        if (used.has(key) && used.get(key) !== entry.id)
+          throw new Error("cache contains colliding persisted " + kind + " filenames");
+        used.set(key, entry.id);
+      }
+      const groupKey = parentKey + "\0" + collisionKey(rawName(entry));
+      if (!groups.has(groupKey)) groups.set(groupKey, []);
+      groups.get(groupKey).push(entry);
+    }
+    let changed = false;
+    for (const peers of groups.values()) {
+      peers.sort((a, b) => a.id.localeCompare(b.id));
+      const used = usedByParent.get(String(peers[0].parentId || ""));
+      const base = sanitize(rawName(peers[0]));
+      for (const entry of peers) {
+        if (entry[outputField]) continue;
+        let candidate = peers.length > 1 || used.has(collisionKey(base))
+          ? withSuffix(base, " [" + collisionSafeId(entry, peers) + "]") : base;
+        if (used.has(collisionKey(candidate)))
+          candidate = withSuffix(base, " [" + idFingerprint(entry.id) + "]");
+        if (used.has(collisionKey(candidate)))
+          throw new Error("could not assign a collision-free " + kind + " filename");
+        entry[outputField] = candidate;
+        used.set(collisionKey(candidate), entry.id);
+        changed = true;
+      }
+    }
+    return changed;
+  }
+
+  function assignStableOutputBases() {
+    const entries = [...scanState.songs.values()];
+    const stemsChanged = assignStableBases(
+      entries.filter((entry) => entry.isStem),
+      "stemOutputBase", (entry) => entry.stemName || entry.title, "stem");
+    const variationsChanged = assignStableBases(
+      entries.filter((entry) => entry.isInfill),
+      "variationOutputBase", (entry) => entry.title, "variation");
+    return stemsChanged || variationsChanged;
+  }
+
   const variationFileBase = (entry) => {
+    if (entry.variationOutputBase) return sanitize(entry.variationOutputBase);
     const base = sanitize(entry.title);
     const key = collisionKey(entry.title);
     const duplicates = [...scanState.songs.values()].filter((candidate) =>
@@ -830,7 +1057,15 @@ void (async () => {
     // A parent may be absent from the selected feeds. Key the fallback directory
     // by that parent rather than by the child title: otherwise Vocals and Drums
     // belonging to one missing parent are incorrectly split into two song folders.
-    return withSuffix("Missing parent", " [" + sanitize(entry.parentId || entry.id) + "]");
+    const rawId = String(entry.parentId || entry.id);
+    const peers = [...new Set([...scanState.songs.values()]
+      .filter((candidate) => (candidate.isStem || candidate.isInfill) &&
+        !scanState.songs.has(candidate.parentId))
+      .map((candidate) => String(candidate.parentId || candidate.id)))];
+    let token = sanitize(rawId);
+    if (peers.some((peer) => peer !== rawId && collisionKey(peer) === collisionKey(rawId)))
+      token = truncatePortable(token, 80) + "-" + idFingerprint(rawId);
+    return withSuffix("Missing parent", " [" + token + "]");
   };
 
   // download() returns { files: "mp3+wav:fail+midi:skip", fails: 1 }
@@ -838,13 +1073,18 @@ void (async () => {
     const { id, title, isStem, parentId } = entry;
     const clean = sanitize(title);
     const fmt = operationOptions?.formats || getFormats();
-    const out = { files: [], fails: 0 };
+    const out = { files: [], fails: 0, errors: [] };
+    const fail = (format, error) => {
+      out.fails++;
+      out.files.push(format + ":fail");
+      out.errors.push(format.toUpperCase() + ": " + (error?.message || error));
+    };
     const saveFallbackMp3 = async (name) => {
       try {
         const blob = await fetchMp3(entry);
         saveViaDownload(name + ".mp3", blob);
         out.files.push("mp3");
-      } catch (e) { out.fails++; out.files.push("mp3:fail"); }
+      } catch (e) { fail("mp3", e); }
     };
     const saveMp3 = async (d, name) => {
       if (await existsInFolder(d, name + ".mp3")) out.files.push("mp3:skip");
@@ -853,7 +1093,7 @@ void (async () => {
           const blob = await fetchMp3(entry);
           await saveToFolder(d, name + ".mp3", blob);
           out.files.push("mp3");
-        } catch (e) { out.fails++; out.files.push("mp3:fail"); }
+        } catch (e) { fail("mp3", e); }
       }
     };
     const saveWav = async (d, name) => {
@@ -861,10 +1101,10 @@ void (async () => {
       else {
         try {
           const url = await getWavUrl(id);
-          const blob = await fetchBlob(url);
+          const blob = await fetchBlob(url, "wav");
           await saveToFolder(d, name + ".wav", blob);
           out.files.push("wav");
-        } catch (e) { out.fails++; out.files.push("wav:fail"); }
+        } catch (e) { fail("wav", e); }
       }
     };
     const saveMidi = async (d, name) => {
@@ -876,7 +1116,7 @@ void (async () => {
           if (d) await saveToFolder(d, name + ".mid", blob);
           else saveViaDownload(name + ".mid", blob);
           out.files.push("midi");
-        } catch (e) { out.fails++; out.files.push("midi:fail"); }
+        } catch (e) { fail("midi", e); }
       }
     };
     if (isStem) {
@@ -930,7 +1170,7 @@ void (async () => {
           const blob = await fetchMp3(entry);
           saveViaDownload(fallbackBase + ".mp3", blob);
           out.files.push("mp3");
-        } catch (e) { out.fails++; out.files.push("mp3:fail"); }
+        } catch (e) { fail("mp3", e); }
       } else await saveMp3(songDir, clean);
     }
     if (fmt.wav) {
@@ -938,10 +1178,10 @@ void (async () => {
       else if (!dir) {
         try {
           const url = await getWavUrl(id);
-          const blob = await fetchBlob(url);
+          const blob = await fetchBlob(url, "wav");
           saveViaDownload(fallbackBase + ".wav", blob);
           out.files.push("wav");
-        } catch (e) { out.fails++; out.files.push("wav:fail"); }
+        } catch (e) { fail("wav", e); }
       } else await saveWav(songDir, clean);
     }
     if (fmt.midi) await saveMidi(songDir, dir ? clean : fallbackBase);
@@ -971,6 +1211,12 @@ void (async () => {
         throw new Error("cache stemsIncluded field is not a boolean");
       if ((cached.songs || []).some((song) => !song || typeof song !== "object" || typeof song.id !== "string"))
         throw new Error("cache contains an invalid song entry");
+      if ((cached.songs || []).some((song) => song.stemOutputBase !== undefined &&
+          typeof song.stemOutputBase !== "string"))
+        throw new Error("cache contains an invalid persisted stem filename");
+      if ((cached.songs || []).some((song) => song.variationOutputBase !== undefined &&
+          typeof song.variationOutputBase !== "string"))
+        throw new Error("cache contains an invalid persisted variation filename");
       if ((cached.seenIds || []).some((id) => typeof id !== "string"))
         throw new Error("cache contains an invalid seen ID");
       return cached;
@@ -1055,6 +1301,7 @@ void (async () => {
     ]);
     const failedScan = scans.find((result) => result.status === "rejected");
     if (failedScan) throw failedScan.reason;
+    assignStableOutputBases();
     await persistCache(dir);
     let out = [...scanState.songs.values()];
     if (!includeStems()) out = out.filter((s) => !s.isStem);
@@ -1085,6 +1332,7 @@ void (async () => {
     const needStemRescan = cached && includeStems() && !cacheIncludedStems;
     if (cached && !rescan && !needStemRescan && cached.libDone && cached.wsDone) {
       restoreScanState(cached);
+      if (assignStableOutputBases()) await persistCache(dir);
       songs = [...scanState.songs.values()];
       if (!includeStems()) songs = songs.filter((s) => !s.isStem);
       if (LIMIT > 0) songs = songs.slice(0, LIMIT);
@@ -1131,12 +1379,12 @@ void (async () => {
   const startBtn = btn;
   let busy = false;
   let rescanLink = null;
-  const setBusy = (isBusy) => {
+  const setBusy = (isBusy, canStop = isBusy) => {
     // Set the guard before any awaited picker/API call so rapid clicks cannot
     // start overlapping scans or downloads.
     busy = isBusy;
     startBtn.disabled = isBusy;
-    stopBtn.disabled = !isBusy;
+    stopBtn.disabled = !canStop;
     pickBtn.disabled = isBusy || !usePicker;
     for (const cb of [mp3Check, wavCheck, midiCheck, stemsCheck]) cb.disabled = isBusy;
     if (rescanLink) {
@@ -1147,9 +1395,9 @@ void (async () => {
   };
 
   // choose folder only (does not start)
-  pickBtn.addEventListener("click", async () => {
-    if (!usePicker || busy) return;
-    setBusy(true);
+  pickBtn.addEventListener("click", () => trackTask((async () => {
+    if (!usePicker || busy || destroyed) return;
+    setBusy(true, false);
     try {
       const dir = await window.showDirectoryPicker({ mode: "readwrite" });
       if (destroyed) return;
@@ -1161,15 +1409,17 @@ void (async () => {
       pickedDir = dir;
       setStatus("Folder selected. Press Start to download.");
     } catch (e) {
-      setStatus("Folder picker cancelled.");
+      setStatus(e?.name === "AbortError"
+        ? "Folder picker cancelled."
+        : "Folder picker failed: " + (e?.message || e));
     } finally {
       setBusy(false);
     }
-  });
+  })()));
 
   // start downloads (scans first if no cache)
-  startBtn.addEventListener("click", async () => {
-    if (busy) return;
+  startBtn.addEventListener("click", () => trackTask((async () => {
+    if (busy || destroyed) return;
     operationOptions = {
       formats: getFormats(),
       includeStems: stemsCheck.checked || INCLUDE_STEMS,
@@ -1186,7 +1436,12 @@ void (async () => {
       let dir = pickedDir;
       if (!dir && usePicker) {
         try { dir = await window.showDirectoryPicker({ mode: "readwrite" }); }
-        catch (e) { setStatus("Folder picker cancelled."); return; }
+        catch (e) {
+          setStatus(e?.name === "AbortError"
+            ? "Folder picker cancelled."
+            : "Folder picker failed: " + (e?.message || e));
+          return;
+        }
         if (destroyed) return;
         pickedDir = dir;
       }
@@ -1205,6 +1460,7 @@ void (async () => {
         operationOptions.creditApproved = true;
       }
       let ok = 0, failed = 0, skipped = 0;
+      const runErrors = [];
       for (let i = 0; i < songs.length; i++) {
         if (stopRequested) break;
         const e = songs[i];
@@ -1217,16 +1473,23 @@ void (async () => {
           else if (wasSkipped) skipped++;
           else if (r.fails > 0) failed++;
           else ok++;
+          for (const message of r.errors || []) runErrors.push(e.title + " - " + message);
           setStatus(`[${i + 1}/${songs.length}] ${files}\n${ok} downloaded, ${skipped} skipped, ${failed} failed`);
         } catch (err) {
           failed++;
+          runErrors.push(e.title + " - " + (err?.message || err));
           setStatus(`[${i + 1}/${songs.length}] FAILED: ${err.message}\n${ok} downloaded, ${skipped} skipped, ${failed} failed`);
         }
         if (i < songs.length - 1) await stopSleep(PAUSE_MS);
       }
-      setStatus(stopRequested
+      const summary = stopRequested
         ? `Stopped. ${ok} downloaded, ${skipped} skipped, ${failed} failed. Rerun to resume.`
-        : `Done. ${ok} downloaded, ${skipped} skipped, ${failed} failed.`);
+        : `Done. ${ok} downloaded, ${skipped} skipped, ${failed} failed.`;
+      const details = runErrors.length
+        ? "\nErrors:\n" + runErrors.slice(0, 5).join("\n") +
+          (runErrors.length > 5 ? `\n...and ${runErrors.length - 5} more.` : "")
+        : "";
+      setStatus(summary + details);
       startBtn.textContent = stopRequested ? "Resume" : "Done";
     } catch (err) {
       setStatus("Error: " + (err && err.message ? err.message : err));
@@ -1238,7 +1501,7 @@ void (async () => {
       operationOptions = null;
       setBusy(false);
     }
-  });
+  })()));
 
   // small re-scan link so new songs get picked up without deleting the cache
   if (usePicker) {
@@ -1246,8 +1509,8 @@ void (async () => {
     rescanLink = link;
     link.textContent = "Re-scan for new songs";
     link.style.cssText = "display:block;margin-top:8px;color:#ff6b9d;cursor:pointer;font-size:12px;text-decoration:underline";
-    link.addEventListener("click", async () => {
-      if (busy) return;
+    link.addEventListener("click", () => trackTask((async () => {
+      if (busy || destroyed) return;
       operationOptions = {
         formats: getFormats(),
         includeStems: stemsCheck.checked || INCLUDE_STEMS,
@@ -1284,6 +1547,10 @@ void (async () => {
           // but keep done flags false so feeds actually re-walk
           for (const s of cached.songs) scanState.songs.set(s.id, s);
           for (const id of cached.seenIds || []) scanState.seenIds.add(id);
+          // Freeze legacy unsuffixed stem paths before discovering new peers.
+          // A later duplicate then receives a suffix without renaming the file
+          // that an earlier run already downloaded.
+          assignStableOutputBases();
         }
         const { songs: fresh } = await enumerateSongs(dir);
         if (stopRequested) {
@@ -1305,7 +1572,9 @@ void (async () => {
         rescan = false;
         earlyStopLibrary = false;
         earlyStopWorkspace = false;
-        setStatus("Re-scan failed or cancelled: " + e.message);
+        setStatus(e?.name === "AbortError"
+          ? "Re-scan cancelled."
+          : "Re-scan failed: " + (e?.message || e));
       } finally {
         operationController?.abort();
         operationController = null;
@@ -1314,14 +1583,18 @@ void (async () => {
         stopRequested = false;
         setBusy(false);
       }
-    });
+    })()));
     panel.appendChild(link);
   }
 
   for (const cb of [mp3Check, wavCheck, midiCheck, stemsCheck]) {
-    cb.addEventListener("change", refreshCredits);
+    cb.addEventListener("change", () => {
+      trackTask(refreshCredits()).catch((err) => {
+        if (!destroyed) creditsBox.textContent = "Could not read credit balance: " + (err?.message || err);
+      });
+    });
   }
-  refreshCredits().catch((err) => {
+  trackTask(refreshCredits()).catch((err) => {
     if (!destroyed) creditsBox.textContent = "Could not read credit balance: " + (err?.message || err);
   });
 })();
