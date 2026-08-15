@@ -41,7 +41,7 @@ Download all your songs from Suno as MP3, WAV, and MIDI with one paste into the 
 
 9. Click **Start**.
 
-> Chrome or Edge is required for the folder picker, per-song folders, cache, and automatic resume/skip behavior. On Firefox/Safari it falls back to normal per-file downloads; the browser controls duplicate naming, and reruns cannot inspect or skip files you already downloaded.
+> Chrome or Edge is required for the folder picker, per-song folders, cache, and automatic resume/skip behavior. On Firefox/Safari it falls back to normal per-file downloads. The script disambiguates clips found in the same scan, but reruns cannot inspect or skip prior downloads, so the browser controls any repeat-download suffixes.
 
 ## What you get
 

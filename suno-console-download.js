@@ -1,7 +1,7 @@
 /**
  * Suno bulk downloader (paste into browser console while logged into suno.com).
  *
- * Downloads all songs from your Library + Workspace as MP3 and/or WAV into a
+ * Downloads all songs from your Library + Workspace as MP3, WAV, and/or MIDI into a
  * folder of your choice - no per-file save prompts. Each song gets its own
  * sub-folder:
  *
@@ -57,9 +57,34 @@ void (async () => {
   const INCLUDE_WORKSPACE = true; // your workspace (drafts/in-progress)
   const INCLUDE_STEMS = false; // also download already-generated stems (no credits needed)
   const PAUSE_MS = 1500; // delay between songs (be polite to the API)
+  const MAX_SCAN_PAGES = 10000; // final backstop for a broken endlessly-paginated API
 
   const API = "https://studio-api-prod.suno.com";
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const portableSize = (value) => {
+    let bytes = 0;
+    let codeUnits = 0;
+    for (const char of String(value)) {
+      const cp = char.codePointAt(0);
+      bytes += cp <= 0x7f ? 1 : cp <= 0x7ff ? 2 : cp <= 0xffff ? 3 : 4;
+      codeUnits += char.length;
+    }
+    return { bytes, codeUnits };
+  };
+  const truncatePortable = (value, maxBytes, maxCodeUnits = maxBytes) => {
+    let result = "";
+    let bytes = 0;
+    let codeUnits = 0;
+    for (const char of String(value)) {
+      const cp = char.codePointAt(0);
+      const charBytes = cp <= 0x7f ? 1 : cp <= 0x7ff ? 2 : cp <= 0xffff ? 3 : 4;
+      if (bytes + charBytes > maxBytes || codeUnits + char.length > maxCodeUnits) break;
+      result += char;
+      bytes += charBytes;
+      codeUnits += char.length;
+    }
+    return result;
+  };
   const sanitize = (name) => {
     let clean = String(name ?? "")
       .replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_")
@@ -70,7 +95,10 @@ void (async () => {
     // Windows rejects these basenames even with an extension. Keep ordinary
     // legacy names unchanged, but make unsafe names portable across platforms.
     if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(clean)) clean = "_" + clean;
-    clean = Array.from(clean).slice(0, 180).join("").replace(/[. ]+$/g, "");
+    // Native component limits are measured in UTF-8 bytes on common Unix/macOS
+    // filesystems and UTF-16 code units on Windows. A code-point-only cap lets
+    // emoji/CJK titles exceed both limits even though an ASCII title is safe.
+    clean = truncatePortable(clean, 180).replace(/[. ]+$/g, "");
     return clean || "untitled";
   };
 
@@ -79,6 +107,9 @@ void (async () => {
   let destroyed = false;
   const instanceController = new AbortController();
   let operationController = null;
+  // Directory creation and file writes cannot take an AbortSignal. Keep every
+  // in-flight filesystem mutation here so a replacement instance waits for the
+  // old one to become completely quiescent before it starts using the folder.
   const activeFileWrites = new Set();
   const panel = document.createElement("div");
   panel.id = "suno-bulk-downloader-panel";
@@ -132,9 +163,9 @@ void (async () => {
       operationController?.abort();
       instanceController.abort();
       panel.remove();
-      // File System Access writes cannot take an AbortSignal. Waiting for the
-      // small set already in flight prevents a replacement instance from
-      // writing the same file or cache concurrently.
+      // File System Access mutations cannot take an AbortSignal. Waiting for
+      // the small set already in flight prevents a replacement instance from
+      // creating directories or writing the same file concurrently.
       await Promise.allSettled([...activeFileWrites]);
       if (typeof persistChain !== "undefined") await persistChain.catch(() => {});
     },
@@ -302,8 +333,29 @@ void (async () => {
     return historyParent ? historyParent.stem_from_id : null;
   };
 
+  const clipAudioUrl = (c) => {
+    const media = c.media_urls;
+    const candidates = [
+      c.audio_url,
+      media?.audio_url,
+      media?.audio,
+      media?.mp3,
+      ...(Array.isArray(media) ? media.map((item) => item?.audio_url || item?.url) : []),
+    ];
+    for (const value of candidates) {
+      if (typeof value !== "string" || !value.trim()) continue;
+      try {
+        const parsed = new URL(value);
+        if (parsed.protocol === "https:") return parsed.href;
+      } catch {}
+    }
+    return null;
+  };
+
   const toEntry = (c) => {
     const e = { id: c.id, title: String(c.title || "untitled").trim() };
+    const audioUrl = clipAudioUrl(c);
+    if (audioUrl) e.audioUrl = audioUrl;
     if (isStem(c)) {
       e.isStem = true;
       e.parentId = stemParentId(c);
@@ -325,15 +377,16 @@ void (async () => {
     seenIds: new Set(),
     libCursor: null,
     wsCursor: null,
-    libDone: false,
-    wsDone: false,
+    libDone: !INCLUDE_LIBRARY,
+    wsDone: !INCLUDE_WORKSPACE,
     stemsIncluded: false,
     scanned: 0,
   };
 
   // during a re-scan we can stop a feed as soon as a page is 100% already-seen
   // (feeds are newest-first, so anything behind a fully-known page is known too)
-  let earlyStop = false;
+  let earlyStopLibrary = false;
+  let earlyStopWorkspace = false;
   // This must remain an immutable snapshot. The library and workspace scans run
   // concurrently, so using their live shared seenIds would let one scan make new
   // clips look old to the other and could stop a feed too early.
@@ -344,13 +397,20 @@ void (async () => {
       " | scanned " + scanState.scanned + " clips, found " + scanState.songs.size + " songs" +
       (scanState.songs.size ? "" : " (mostly stems - will skip them)"));
 
+  const cursorKey = (cursor) => {
+    try { return JSON.stringify(cursor); } catch { return String(cursor); }
+  };
+
   async function getLibrary(dir, onProgress, persist) {
     if (!INCLUDE_LIBRARY || scanState.libDone) return;
     let cursor = scanState.libCursor;
     let page = 0;
+    const requestedCursors = new Set();
     do {
       if (stopRequested) break;
       page++;
+      if (page > MAX_SCAN_PAGES) throw new Error("library feed exceeded the pagination safety limit");
+      requestedCursors.add(cursorKey(cursor));
       progress("Scanning library", page);
       const r = await api("POST", "/api/feed/v3", { n: 50, p: null, client_type: "web", cursor });
       if (r.status !== 200 && (stopRequested || destroyed)) return;
@@ -365,16 +425,18 @@ void (async () => {
       for (const c of clips) {
         if (!c || typeof c !== "object" || typeof c.id !== "string")
           throw new Error("library feed error: invalid clip entry");
-        if (earlyStop && knownBeforeRescan.has(c.id)) known++;
+        if (earlyStopLibrary && knownBeforeRescan.has(c.id)) known++;
         scanState.seenIds.add(c.id);
         if (c.status === "complete" && (includeStems() || !isStem(c)))
           scanState.songs.set(c.id, toEntry(c));
       }
       cursor = r.j.has_more ? r.j.next_cursor : null;
+      if (cursor && requestedCursors.has(cursorKey(cursor)))
+        throw new Error("library feed pagination cursor did not advance");
       scanState.libCursor = cursor;
       if (!cursor) scanState.libDone = true;
       await persist(dir);
-      if (earlyStop && clips.length && known === clips.length) {
+      if (earlyStopLibrary && clips.length && known === clips.length) {
         scanState.libDone = true;
         scanState.libCursor = null;
         break;
@@ -387,9 +449,12 @@ void (async () => {
     if (!INCLUDE_WORKSPACE || scanState.wsDone) return;
     let cursor = scanState.wsCursor;
     let page = 0;
+    const requestedCursors = new Set();
     do {
       if (stopRequested) break;
       page++;
+      if (page > MAX_SCAN_PAGES) throw new Error("project feed exceeded the pagination safety limit");
+      requestedCursors.add(cursorKey(cursor));
       progress("Scanning workspace", page);
       const qs = cursor ? `?n=50&cursor=${encodeURIComponent(JSON.stringify(cursor))}` : "?n=50";
       const r = await api("GET", "/api/project/feed" + qs);
@@ -409,7 +474,7 @@ void (async () => {
         if (typeof c !== "object" || typeof c.id !== "string")
           throw new Error("project feed error: invalid clip entry");
         scannedThisPage++;
-        if (earlyStop && knownBeforeRescan.has(c.id)) known++;
+        if (earlyStopWorkspace && knownBeforeRescan.has(c.id)) known++;
         scanState.seenIds.add(c.id);
         if (c.status === "complete" && (includeStems() || !isStem(c))) {
           scanState.songs.set(c.id, toEntry(c));
@@ -417,10 +482,12 @@ void (async () => {
       }
       scanState.scanned += scannedThisPage;
       cursor = r.j.next_cursor || null;
+      if (cursor && requestedCursors.has(cursorKey(cursor)))
+        throw new Error("project feed pagination cursor did not advance");
       scanState.wsCursor = cursor;
       if (!cursor) scanState.wsDone = true;
       await persist(dir);
-      if (earlyStop && scannedThisPage && known === scannedThisPage) {
+      if (earlyStopWorkspace && scannedThisPage && known === scannedThisPage) {
         scanState.wsDone = true;
         scanState.wsCursor = null;
         break;
@@ -432,12 +499,19 @@ void (async () => {
   // ---------- saving ----------
   async function getOrCreateSubDir(parent, name) {
     if (!parent) return null;
-    if (destroyed) throw new Error("downloader instance was replaced");
-    try {
-      return await parent.getDirectoryHandle(name, { create: true });
-    } catch (e) {
-      throw new Error("could not create sub-folder '" + name + "': " + e.message);
-    }
+    const creation = (async () => {
+      if (destroyed) throw new Error("downloader instance was replaced");
+      try {
+        const child = await parent.getDirectoryHandle(name, { create: true });
+        if (destroyed) throw new Error("downloader instance was replaced");
+        return child;
+      } catch (e) {
+        if (destroyed) throw new Error("downloader instance was replaced");
+        throw new Error("could not create sub-folder '" + name + "': " + e.message);
+      }
+    })();
+    activeFileWrites.add(creation);
+    try { return await creation; } finally { activeFileWrites.delete(creation); }
   }
   async function saveToFolder(dir, name, blob) {
     const write = (async () => {
@@ -527,27 +601,77 @@ void (async () => {
     throw new Error("download failed after retries");
   }
 
+  async function fetchMp3(entry) {
+    const fallback = `https://cdn1.suno.ai/${entry.id}.mp3`;
+    const preferred = typeof entry.audioUrl === "string" ? entry.audioUrl : fallback;
+    try {
+      return await fetchBlob(preferred);
+    } catch (preferredError) {
+      // Older caches have no audioUrl and continue to use the established CDN
+      // convention. If a cached feed URL later expires, try that convention as
+      // a compatibility fallback before reporting the song as failed.
+      if (preferred === fallback || destroyed || stopRequested ||
+          operationController?.signal.aborted || instanceController.signal.aborted)
+        throw preferredError;
+      try { return await fetchBlob(fallback); } catch { throw preferredError; }
+    }
+  }
+
+  const parseWavStatus = (r) => {
+    if (r.status === 404) return { state: "missing" };
+    if (r.status !== 200) return { state: "error" };
+    const value = r.j?.wav_file_url;
+    if (typeof value === "string" && value.trim()) {
+      let parsed;
+      try { parsed = new URL(value); } catch { throw new Error("wav_file returned an invalid URL"); }
+      if (parsed.protocol !== "https:")
+        throw new Error("wav_file returned an unsafe URL");
+      return { state: "ready", url: parsed.href };
+    }
+    const conversionState = String(r.j?.state ?? r.j?.status ?? "").toLowerCase();
+    if (["pending", "queued", "running", "processing", "in_progress"].includes(conversionState))
+      return { state: "pending" };
+    // The current API uses an empty object to mean that no WAV exists yet.
+    // Do not treat a non-empty, unknown 200 response as absence: it might be a
+    // changed error/status shape, and POSTing then could spend credits needlessly.
+    if (r.j && typeof r.j === "object" && !Array.isArray(r.j) && Object.keys(r.j).length === 0)
+      return { state: "missing" };
+    throw new Error("wav_file returned an unexpected response shape");
+  };
+
   async function getWavUrl(id) {
     if (!operationOptions?.creditApproved) throw new Error("WAV conversion was not approved");
     let r = await api("GET", `/api/gen/${id}/wav_file/`);
-    if (r.status === 200 && r.j && r.j.wav_file_url) return r.j.wav_file_url;
-    if (r.status !== 200 && r.status !== 404) throw new Error("wav_file " + r.status);
+    let wav = parseWavStatus(r);
+    if (wav.state === "ready") return wav.url;
+    if (wav.state === "error") throw new Error("wav_file " + r.status);
+    const alreadyPending = wav.state === "pending";
     // A lost response is ambiguous: Suno may have accepted this paid conversion.
     // Never automatically resubmit it. One retry remains available only for the
     // explicit 401 path, which is known not to have run the conversion.
-    r = await api("POST", `/api/gen/${id}/convert_wav/`, null, 1, { retryAmbiguous: false });
+    if (!alreadyPending)
+      r = await api("POST", `/api/gen/${id}/convert_wav/`, null, 1, { retryAmbiguous: false });
     // A network failure or 5xx may happen after the paid request reached Suno.
     // Poll the read-only result endpoint in that ambiguous case, but never risk
     // a second conversion POST. Explicit 4xx responses are safe to surface.
-    const ambiguous = r.status === 0 || (r.status >= 500 && r.status <= 599);
-    if (!ambiguous && (r.status < 200 || r.status >= 300))
-      throw new Error("convert_wav " + r.status + ": " + (r.j?.raw || r.j?.detail || "unexpected response"));
+    const ambiguous = !alreadyPending && (r.status === 0 || (r.status >= 500 && r.status <= 599));
+    if (!alreadyPending) {
+      if (!ambiguous && (r.status < 200 || r.status >= 300))
+        throw new Error("convert_wav " + r.status + ": " + (r.j?.raw || r.j?.detail || "unexpected response"));
+      // Some API versions return the finished URL directly from the conversion
+      // request. Accept it without waiting for an extra status-poll interval.
+      if (r.status >= 200 && r.status < 300 && typeof r.j?.wav_file_url === "string") {
+        wav = parseWavStatus({ status: 200, j: { wav_file_url: r.j.wav_file_url } });
+        return wav.url;
+      }
+    }
     for (let n = 0; n < 60; n++) {
       await stopSleep(5000);
       if (stopRequested) throw new Error("wav conversion stopped");
       r = await api("GET", `/api/gen/${id}/wav_file/`);
-      if (r.status === 200 && r.j && r.j.wav_file_url) return r.j.wav_file_url;
-      if (r.status !== 200 && r.status !== 404) throw new Error("wav_file " + r.status);
+      wav = parseWavStatus(r);
+      if (wav.state === "ready") return wav.url;
+      if (wav.state === "error") throw new Error("wav_file " + r.status);
     }
     throw new Error(ambiguous
       ? "WAV conversion result is still unknown after an ambiguous request; it was not resubmitted"
@@ -649,10 +773,18 @@ void (async () => {
       ? entry.id : short;
   };
   const withSuffix = (base, suffix) => {
-    const suffixChars = Array.from(suffix);
-    const room = Math.max(1, 220 - suffixChars.length);
-    const head = Array.from(base).slice(0, room).join("").replace(/[. ]+$/g, "") || "untitled";
-    return head + suffix;
+    // Leave room for an extension under the usual 255-byte/code-unit component
+    // limit. Keep the identifying suffix intact whenever it is reasonably sized.
+    let tail = String(suffix);
+    let tailSize = portableSize(tail);
+    if (tailSize.bytes >= 220 || tailSize.codeUnits >= 220) {
+      tail = truncatePortable(tail, 110);
+      tailSize = portableSize(tail);
+    }
+    const head = truncatePortable(base,
+      Math.max(1, 220 - tailSize.bytes),
+      Math.max(1, 220 - tailSize.codeUnits)).replace(/[. ]+$/g, "") || "untitled";
+    return head + tail;
   };
   const collisionKey = (name) => sanitize(name).normalize("NFC").toLowerCase();
 
@@ -695,18 +827,10 @@ void (async () => {
   };
 
   const orphanParentFolder = (entry) => {
-    const base = sanitize(entry.title);
-    const key = collisionKey(entry.title);
-    const collisions = [...scanState.songs.values()].filter((candidate) =>
-      candidate.isStem === entry.isStem &&
-      candidate.isInfill === entry.isInfill &&
-      !scanState.songs.has(candidate.parentId) &&
-      collisionKey(candidate.title) === key &&
-      candidate.parentId !== entry.parentId
-    );
-    // A parent may be absent from the selected feeds. Different absent parents
-    // must not collapse into the same legacy title-only fallback directory.
-    return collisions.length ? withSuffix(base, " [" + sanitize(entry.parentId || entry.id) + "]") : base;
+    // A parent may be absent from the selected feeds. Key the fallback directory
+    // by that parent rather than by the child title: otherwise Vocals and Drums
+    // belonging to one missing parent are incorrectly split into two song folders.
+    return withSuffix("Missing parent", " [" + sanitize(entry.parentId || entry.id) + "]");
   };
 
   // download() returns { files: "mp3+wav:fail+midi:skip", fails: 1 }
@@ -717,7 +841,7 @@ void (async () => {
     const out = { files: [], fails: 0 };
     const saveFallbackMp3 = async (name) => {
       try {
-        const blob = await fetchBlob(`https://cdn1.suno.ai/${id}.mp3`);
+        const blob = await fetchMp3(entry);
         saveViaDownload(name + ".mp3", blob);
         out.files.push("mp3");
       } catch (e) { out.fails++; out.files.push("mp3:fail"); }
@@ -726,7 +850,7 @@ void (async () => {
       if (await existsInFolder(d, name + ".mp3")) out.files.push("mp3:skip");
       else {
         try {
-          const blob = await fetchBlob(`https://cdn1.suno.ai/${id}.mp3`);
+          const blob = await fetchMp3(entry);
           await saveToFolder(d, name + ".mp3", blob);
           out.files.push("mp3");
         } catch (e) { out.fails++; out.files.push("mp3:fail"); }
@@ -765,7 +889,11 @@ void (async () => {
           await saveMp3(stemsDir, fname);
         } else {
           const parent = sanitize(parentEntry?.title || "stem");
-          await saveFallbackMp3(withSuffix(parent + " - " + fname, " [" +
+          // Browser-download mode has no directory hierarchy. One clip-ID
+          // suffix is enough to distinguish both repeated and unique stems;
+          // stemFileBase() may already have added one for folder mode.
+          const fallbackStem = sanitize(entry.stemName || entry.title);
+          await saveFallbackMp3(withSuffix(parent + " - " + fallbackStem, " [" +
             collisionSafeId(entry, [...scanState.songs.values()]) + "]"));
         }
       }
@@ -782,7 +910,8 @@ void (async () => {
           await saveMp3(varsDir, variationFileBase(entry));
         } else {
           const parent = sanitize(parentEntry?.title || "variation");
-          await saveFallbackMp3(withSuffix(parent + " - " + variationFileBase(entry), " [" +
+          const fallbackVariation = sanitize(entry.title);
+          await saveFallbackMp3(withSuffix(parent + " - " + fallbackVariation, " [" +
             collisionSafeId(entry, [...scanState.songs.values()]) + "]"));
         }
       }
@@ -798,7 +927,7 @@ void (async () => {
       if (dir && await existsInFolder(songDir, clean + ".mp3")) out.files.push("mp3:skip");
       else if (!dir) {
         try {
-          const blob = await fetchBlob(`https://cdn1.suno.ai/${id}.mp3`);
+          const blob = await fetchMp3(entry);
           saveViaDownload(fallbackBase + ".mp3", blob);
           out.files.push("mp3");
         } catch (e) { out.fails++; out.files.push("mp3:fail"); }
@@ -892,8 +1021,8 @@ void (async () => {
     scanState.seenIds = new Set(cached.seenIds || []);
     scanState.libCursor = cached.libCursor ?? null;
     scanState.wsCursor = cached.wsCursor ?? null;
-    scanState.libDone = !!cached.libDone;
-    scanState.wsDone = !!cached.wsDone;
+    scanState.libDone = !INCLUDE_LIBRARY || !!cached.libDone;
+    scanState.wsDone = !INCLUDE_WORKSPACE || !!cached.wsDone;
     // Old caches did not record this explicitly. Existing stem entries prove
     // that stems were included; zero-stem old caches get one compatibility scan.
     scanState.stemsIncluded = typeof cached.stemsIncluded === "boolean"
@@ -907,8 +1036,8 @@ void (async () => {
     scanState.seenIds = new Set();
     scanState.libCursor = null;
     scanState.wsCursor = null;
-    scanState.libDone = false;
-    scanState.wsDone = false;
+    scanState.libDone = !INCLUDE_LIBRARY;
+    scanState.wsDone = !INCLUDE_WORKSPACE;
     scanState.stemsIncluded = false;
     scanState.scanned = 0;
   }
@@ -961,11 +1090,12 @@ void (async () => {
       if (LIMIT > 0) songs = songs.slice(0, LIMIT);
       songsDir = dir;
       songsIncludedStems = wantsStems;
-      setStatus(`Using cache: ${songs.length} songs.\nPress Start to download.`);
+      setStatus(`Using cache: ${songs.length} download items.\nPress Start to download.`);
       return true;
     }
     stopRequested = false;
-    earlyStop = false; // stems newly requested -> must walk the full feed once
+    earlyStopLibrary = false; // normal/partial-cache scans resume from their saved cursors
+    earlyStopWorkspace = false;
     if (cached) restoreScanState(cached);
     else resetScanState();
     if (needStemRescan) {
@@ -974,8 +1104,8 @@ void (async () => {
       scanState.seenIds = new Set();
       scanState.libCursor = null;
       scanState.wsCursor = null;
-      scanState.libDone = false;
-      scanState.wsDone = false;
+      scanState.libDone = !INCLUDE_LIBRARY;
+      scanState.wsDone = !INCLUDE_WORKSPACE;
       scanState.stemsIncluded = true;
     }
     const { songs: fresh } = await enumerateSongs(dir);
@@ -984,7 +1114,7 @@ void (async () => {
     songsDir = dir;
     songsIncludedStems = wantsStems;
     if (!songs.length) { setStatus("No songs found."); return false; }
-    setStatus(`Found ${songs.length} songs (including stems).\nPress Start to download.`);
+    setStatus(`Found ${songs.length} download items${includeStems() ? " (songs and stems)" : ""}.\nPress Start to download.`);
     return true;
   }
 
@@ -1142,7 +1272,12 @@ void (async () => {
           : (cached.songs || []).some((s) => s.isStem)));
         // If this cache predates a stem-inclusive scan, walk every page once;
         // seenIds also contains excluded stems and is not a safe early boundary.
-        earlyStop = scanState.stemsIncluded || !includeStems();
+        const canEarlyStop = scanState.stemsIncluded || !includeStems();
+        // A partial cache only proves that its already-seen newest pages are
+        // known; older pages may never have been scanned. Apply the newest-first
+        // early boundary separately, and only to feeds previously completed.
+        earlyStopLibrary = canEarlyStop && cached?.libDone === true;
+        earlyStopWorkspace = canEarlyStop && cached?.wsDone === true;
         knownBeforeRescan = new Set(cached?.seenIds || []);
         if (cached && cached.songs) {
           // seed from cache so the early-stop boundary knows what's already seen,
@@ -1153,7 +1288,8 @@ void (async () => {
         const { songs: fresh } = await enumerateSongs(dir);
         if (stopRequested) {
           rescan = false;
-          earlyStop = false;
+          earlyStopLibrary = false;
+          earlyStopWorkspace = false;
           setStatus("Re-scan stopped. Progress saved - rerun to resume.");
           return;
         }
@@ -1161,12 +1297,14 @@ void (async () => {
         songsDir = dir;
         songsIncludedStems = includeStems();
         rescan = false;
-        earlyStop = false;
+        earlyStopLibrary = false;
+        earlyStopWorkspace = false;
         knownBeforeRescan = new Set();
-        setStatus(`Re-scan complete: ${songs.length} songs.\nClick "Start" to download.`);
+        setStatus(`Re-scan complete: ${songs.length} download items.\nClick "Start" to download.`);
       } catch (e) {
         rescan = false;
-        earlyStop = false;
+        earlyStopLibrary = false;
+        earlyStopWorkspace = false;
         setStatus("Re-scan failed or cancelled: " + e.message);
       } finally {
         operationController?.abort();
