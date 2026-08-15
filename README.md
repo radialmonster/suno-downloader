@@ -6,9 +6,9 @@ Download all your songs from Suno as MP3, WAV, and MIDI with one paste into the 
 
 - **Downloads your full Suno library + workspace** (auto-detected via Suno's own feed)
 - **MP3 and/or WAV and/or MIDI** — tick whichever you want (WAV/MIDI use Suno's converters, so they're slower per song)
-- **Stems support** — optionally download your already-generated stems into each song's `stems/` folder (`Vocals.mp3`, `Drums.mp3`, ...); repeated generations get a short clip ID so none overwrite each other
+- **Stems support** — optionally download your already-generated stems into each song's `stems/` folder (`Vocals.mp3`, `Drums.mp3`, ...); every member of a repeated generation gets a clip ID so none overwrite each other
 - **Section-edit clips grouped** — Suno's "replace section" variations (e.g. `[01:55.0 - 02:18.4] {verse]`) are filed under their parent song's `variations/` folder
-- **Per-song folders** — one unique folder per song (`<title> [<id>]/`), so duplicate titles never collide
+- **Per-song folders** — one unique folder per song (`<title> [<id>]/`), so duplicate titles never collide; unsafe or overlong filename characters are normalized for portability
 - **Resumable** — stop any time and rerun to continue where you left off; already-downloaded files are skipped
 - **One-time scan** — a cache file (`suno-cache.json`) remembers your song list, so reruns are instant
 - **Zero installs** — just a script pasted into DevTools
@@ -52,7 +52,7 @@ Download all your songs from Suno as MP3, WAV, and MIDI with one paste into the 
     My Song.wav
     My Song.mid
     stems/
-      Vocals.mp3
+      Vocals [a1b2c3d4].mp3
       Vocals [f6e7d8c9].mp3       (when the same stem was generated more than once)
       Drums.mp3
       Bass.mp3
@@ -68,6 +68,7 @@ Download all your songs from Suno as MP3, WAV, and MIDI with one paste into the 
 
 - **Rerun to resume** — the script skips songs that are already downloaded, so a stopped run picks up exactly where it left off.
 - **Re-scan for new songs** — if you've created songs since your last scan, click the "Re-scan for new songs" link. It only scans forward until it hits songs you've already seen, so it's fast even for large libraries.
+- **Cache errors are not hidden** — if `suno-cache.json` is unreadable or malformed, the panel reports the problem instead of silently replacing resume state.
 
 ## First scan takes a few minutes
 

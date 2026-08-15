@@ -33,7 +33,7 @@
 void (async () => {
   const INSTANCE_KEY = "__sunoBulkDownloaderInstance";
   const previousInstance = window[INSTANCE_KEY];
-  if (previousInstance && typeof previousInstance.destroy === "function") previousInstance.destroy();
+  if (previousInstance && typeof previousInstance.destroy === "function") await previousInstance.destroy();
   document.getElementById("suno-bulk-downloader-panel")?.remove();
 
   const FORMAT = "mp3"; // 'mp3', 'wav', or 'both'
@@ -45,12 +45,26 @@ void (async () => {
 
   const API = "https://studio-api-prod.suno.com";
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  const sanitize = (name) =>
-    name.replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_").replace(/\s+/g, " ").trim() || "untitled";
+  const sanitize = (name) => {
+    let clean = String(name ?? "")
+      .replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_")
+      .replace(/\s+/g, " ")
+      .trim()
+      .replace(/[. ]+$/g, "");
+    if (!clean) clean = "untitled";
+    // Windows rejects these basenames even with an extension. Keep ordinary
+    // legacy names unchanged, but make unsafe names portable across platforms.
+    if (/^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(clean)) clean = "_" + clean;
+    clean = Array.from(clean).slice(0, 180).join("").replace(/[. ]+$/g, "");
+    return clean || "untitled";
+  };
 
   // ---------- small floating panel ----------
   let stopRequested = false;
   let destroyed = false;
+  const instanceController = new AbortController();
+  let operationController = null;
+  const activeFileWrites = new Set();
   const panel = document.createElement("div");
   panel.id = "suno-bulk-downloader-panel";
   Object.assign(panel.style, {
@@ -97,16 +111,25 @@ void (async () => {
     midi: midiCheck.checked,
   });
   const instance = {
-    destroy() {
+    async destroy() {
       destroyed = true;
       stopRequested = true;
+      operationController?.abort();
+      instanceController.abort();
       panel.remove();
+      // File System Access writes cannot take an AbortSignal. Waiting for the
+      // small set already in flight prevents a replacement instance from
+      // writing the same file or cache concurrently.
+      await Promise.allSettled([...activeFileWrites]);
+      if (typeof persistChain !== "undefined") await persistChain.catch(() => {});
     },
   };
   window[INSTANCE_KEY] = instance;
 
   // show current credit balance and estimated cost of the selected options
+  let creditRefreshId = 0;
   async function refreshCredits() {
+    const refreshId = ++creditRefreshId;
     const fmt = getFormats();
     let line = "";
     const apiCredits = await api("GET", "/api/billing/credits", null, 1);
@@ -120,7 +143,7 @@ void (async () => {
     } else {
       line += "Could not read credit balance.";
     }
-    creditsBox.textContent = line;
+    if (!destroyed && refreshId === creditRefreshId) creditsBox.textContent = line;
   }
 
   // ---------- token / api ----------
@@ -132,19 +155,36 @@ void (async () => {
     }
     return { Authorization: "Bearer " + token, "Content-Type": "application/json" };
   };
-  const api = async (method, p, body, retries = 5) => {
+  const api = async (method, p, body, retries = 5, options = {}) => {
+    const { retryAmbiguous = true } = options;
     let refreshToken = false;
     for (let i = 0; i <= retries; i++) {
+      const signal = operationController?.signal || instanceController.signal;
+      if (destroyed || stopRequested || signal.aborted)
+        return { status: 0, j: { raw: "request stopped" } };
       let res;
+      let timedOut = false;
+      const requestController = new AbortController();
+      const abortRequest = () => requestController.abort();
+      signal.addEventListener("abort", abortRequest, { once: true });
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        requestController.abort();
+      }, 30000);
       try {
         res = await fetch(API + p, {
           method,
           headers: await headers(refreshToken),
           body: body ? JSON.stringify(body) : undefined,
+          signal: requestController.signal,
         });
       } catch (err) {
-        if (i >= retries) {
-          return { status: 0, j: { raw: "network request failed after retries: " + (err?.message || err) } };
+        clearTimeout(timeout);
+        signal.removeEventListener("abort", abortRequest);
+        if (destroyed || stopRequested || signal.aborted)
+          return { status: 0, j: { raw: "request stopped" } };
+        if (!retryAmbiguous || i >= retries) {
+          return { status: 0, j: { raw: (timedOut ? "request timed out" : "network request failed") + " after retries: " + (err?.message || err) } };
         }
         const wait = Math.min(1000 * Math.pow(2, i), 30000);
         setStatus("Network error - retrying in " + (wait / 1000) + "s...");
@@ -153,14 +193,49 @@ void (async () => {
         continue;
       }
       refreshToken = false;
-      if (res.status === 401 && i < retries) { refreshToken = true; continue; } // token expired -> refresh
-      if (res.status === 429 && i < retries) {
+      if (res.status === 401 && i < retries) {
+        clearTimeout(timeout);
+        signal.removeEventListener("abort", abortRequest);
+        refreshToken = true;
+        continue;
+      } // token expired -> refresh
+      if (res.status === 429 && retryAmbiguous && i < retries) {
+        clearTimeout(timeout);
+        signal.removeEventListener("abort", abortRequest);
         const wait = Math.min(2000 * Math.pow(2, i), 60000); // exponential: 2s,4s,8s,... max 60s
         setStatus("Rate limited - waiting " + (wait / 1000) + "s...");
-        await sleep(wait);
+        await stopSleep(wait);
+        if (destroyed || stopRequested || signal.aborted)
+          return { status: 0, j: { raw: "request stopped" } };
         continue;
       }
-      const text = await res.text();
+      if (res.status >= 500 && res.status <= 599 && retryAmbiguous && i < retries) {
+        clearTimeout(timeout);
+        signal.removeEventListener("abort", abortRequest);
+        const wait = Math.min(1000 * Math.pow(2, i), 30000);
+        setStatus("Server error " + res.status + " - retrying in " + (wait / 1000) + "s...");
+        await stopSleep(wait);
+        if (destroyed || stopRequested || signal.aborted)
+          return { status: 0, j: { raw: "request stopped" } };
+        continue;
+      }
+      let text;
+      try {
+        text = await res.text();
+      } catch (err) {
+        clearTimeout(timeout);
+        signal.removeEventListener("abort", abortRequest);
+        if (destroyed || stopRequested || signal.aborted)
+          return { status: 0, j: { raw: "request stopped" } };
+        if (!retryAmbiguous || i >= retries)
+          return { status: 0, j: { raw: (timedOut ? "response timed out" : "response body failed") + " after retries: " + (err?.message || err) } };
+        const wait = Math.min(1000 * Math.pow(2, i), 30000);
+        setStatus("Network error - retrying in " + (wait / 1000) + "s...");
+        await stopSleep(wait);
+        continue;
+      }
+      clearTimeout(timeout);
+      signal.removeEventListener("abort", abortRequest);
       let j;
       try { j = JSON.parse(text); } catch { j = { raw: text }; }
       return { status: res.status, j };
@@ -172,7 +247,8 @@ void (async () => {
   const isStem = (c) => {
     const m = c.metadata || {};
     if (m.stem_from_id || m.stem_task) return true;
-    return (m.history || []).some((h) => h.stem_task || h.stem_from_id);
+    const history = Array.isArray(m.history) ? m.history : [];
+    return history.some((h) => h && (h.stem_task || h.stem_from_id));
   };
 
   // infill/section-edit clips (e.g. "[01:55.0 - 02:18.4] {verse]") are variations
@@ -180,7 +256,8 @@ void (async () => {
   const infillParentId = (c) => {
     const m = c.metadata || {};
     if (m.task === "infill") {
-      const h = (m.history || []).find((x) => x.type === "concat_infilling" || x.infill);
+      const history = Array.isArray(m.history) ? m.history : [];
+      const h = history.find((x) => x && (x.type === "concat_infilling" || x.infill));
       if (h && h.id) return h.id;
     }
     return null;
@@ -188,19 +265,20 @@ void (async () => {
 
   const stemName = (c) => {
     const m = c.metadata || {};
-    const raw = m.stem_type_group_name || "";
+    const raw = String(m.stem_type_group_name || "");
     return raw.replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_").replace(/\s+/g, "_") || null;
   };
 
   const stemParentId = (c) => {
     const m = c.metadata || {};
     if (m.stem_from_id) return m.stem_from_id;
-    const historyParent = (m.history || []).find((h) => h && h.stem_from_id);
+    const history = Array.isArray(m.history) ? m.history : [];
+    const historyParent = history.find((h) => h && h.stem_from_id);
     return historyParent ? historyParent.stem_from_id : null;
   };
 
   const toEntry = (c) => {
-    const e = { id: c.id, title: (c.title || "untitled").trim() };
+    const e = { id: c.id, title: String(c.title || "untitled").trim() };
     if (isStem(c)) {
       e.isStem = true;
       e.parentId = stemParentId(c);
@@ -231,6 +309,10 @@ void (async () => {
   // during a re-scan we can stop a feed as soon as a page is 100% already-seen
   // (feeds are newest-first, so anything behind a fully-known page is known too)
   let earlyStop = false;
+  // This must remain an immutable snapshot. The library and workspace scans run
+  // concurrently, so using their live shared seenIds would let one scan make new
+  // clips look old to the other and could stop a feed too early.
+  let knownBeforeRescan = new Set();
 
   const progress = (kind, page) =>
     setStatus(kind + " page " + page +
@@ -246,12 +328,19 @@ void (async () => {
       page++;
       progress("Scanning library", page);
       const r = await api("POST", "/api/feed/v3", { n: 50, p: null, client_type: "web", cursor });
-      if (r.status !== 200) { setStatus("library feed error " + r.status); break; }
-      const clips = r.j.clips || [];
+      if (r.status !== 200 && (stopRequested || destroyed)) return;
+      if (r.status !== 200)
+        throw new Error("library feed error " + r.status + ": " + (r.j?.raw || r.j?.detail || "unexpected response"));
+      if (!Array.isArray(r.j?.clips) || typeof r.j.has_more !== "boolean" ||
+          (r.j.has_more && (r.j.next_cursor === null || r.j.next_cursor === undefined)))
+        throw new Error("library feed error: unexpected response shape");
+      const clips = r.j.clips;
       scanState.scanned += clips.length;
       let known = 0;
       for (const c of clips) {
-        if (earlyStop && scanState.seenIds.has(c.id)) known++;
+        if (!c || typeof c !== "object" || typeof c.id !== "string")
+          throw new Error("library feed error: invalid clip entry");
+        if (earlyStop && knownBeforeRescan.has(c.id)) known++;
         scanState.seenIds.add(c.id);
         if (c.status === "complete" && (includeStems() || !isStem(c)))
           scanState.songs.set(c.id, toEntry(c));
@@ -279,15 +368,23 @@ void (async () => {
       progress("Scanning workspace", page);
       const qs = cursor ? `?n=50&cursor=${encodeURIComponent(JSON.stringify(cursor))}` : "?n=50";
       const r = await api("GET", "/api/project/feed" + qs);
-      if (r.status !== 200) { setStatus("project feed error " + r.status); break; }
-      const items = r.j.items || [];
+      if (r.status !== 200 && (stopRequested || destroyed)) return;
+      if (r.status !== 200)
+        throw new Error("project feed error " + r.status + ": " + (r.j?.raw || r.j?.detail || "unexpected response"));
+      if (!Array.isArray(r.j?.items) || !Object.prototype.hasOwnProperty.call(r.j, "next_cursor"))
+        throw new Error("project feed error: unexpected response shape");
+      const items = r.j.items;
       let scannedThisPage = 0;
       let known = 0;
       for (const it of items) {
+        if (!it || typeof it !== "object" || typeof it.type !== "string")
+          throw new Error("project feed error: invalid item entry");
         const c = it.clip;
         if (it.type !== "clip" || !c) continue;
+        if (typeof c !== "object" || typeof c.id !== "string")
+          throw new Error("project feed error: invalid clip entry");
         scannedThisPage++;
-        if (earlyStop && scanState.seenIds.has(c.id)) known++;
+        if (earlyStop && knownBeforeRescan.has(c.id)) known++;
         scanState.seenIds.add(c.id);
         if (c.status === "complete" && (includeStems() || !isStem(c))) {
           scanState.songs.set(c.id, toEntry(c));
@@ -310,6 +407,7 @@ void (async () => {
   // ---------- saving ----------
   async function getOrCreateSubDir(parent, name) {
     if (!parent) return null;
+    if (destroyed) throw new Error("downloader instance was replaced");
     try {
       return await parent.getDirectoryHandle(name, { create: true });
     } catch (e) {
@@ -317,15 +415,29 @@ void (async () => {
     }
   }
   async function saveToFolder(dir, name, blob) {
+    if (destroyed) throw new Error("downloader instance was replaced");
     const handle = await dir.getFileHandle(name, { create: true });
-    const w = await handle.createWritable();
-    await w.write(blob);
-    await w.close();
+    const write = (async () => {
+      let w = null;
+      try {
+        w = await handle.createWritable();
+        await w.write(blob);
+        await w.close();
+      } catch (err) {
+        if (w) try { await w.abort(); } catch {}
+        throw err;
+      }
+    })();
+    activeFileWrites.add(write);
+    try { await write; } finally { activeFileWrites.delete(write); }
   }
 
   async function existsInFolder(dir, name) {
     if (!dir) return false;
-    try { await dir.getFileHandle(name); return true; } catch { return false; }
+    try {
+      const handle = await dir.getFileHandle(name);
+      return (await handle.getFile()).size > 0;
+    } catch { return false; }
   }
 
   function saveViaDownload(name, blob) {
@@ -340,22 +452,45 @@ void (async () => {
   }
 
   async function fetchBlob(url) {
-    const res = await fetch(url);
-    if (!res.ok) throw new Error("HTTP " + res.status + " while fetching " + url);
-    return await res.blob();
+    const signal = operationController?.signal || instanceController.signal;
+    const requestController = new AbortController();
+    const abortRequest = () => requestController.abort();
+    signal.addEventListener("abort", abortRequest, { once: true });
+    if (signal.aborted) abortRequest();
+    const timeout = setTimeout(() => requestController.abort(), 60000);
+    try {
+      const res = await fetch(url, { signal: requestController.signal });
+      if (!res.ok) throw new Error("HTTP " + res.status + " while fetching " + url);
+      const blob = await res.blob();
+      const expected = Number(res.headers.get("content-length"));
+      const contentType = (res.headers.get("content-type") || "").toLowerCase();
+      if (!blob.size || (Number.isFinite(expected) && expected > 0 && blob.size !== expected))
+        throw new Error("incomplete response while fetching " + url);
+      if (/^(text\/|application\/(?:json|xml))/.test(contentType))
+        throw new Error("unexpected " + contentType + " response while fetching " + url);
+      return blob;
+    } finally {
+      clearTimeout(timeout);
+      signal.removeEventListener("abort", abortRequest);
+    }
   }
 
   async function getWavUrl(id) {
+    if (!operationOptions?.creditApproved) throw new Error("WAV conversion was not approved");
     let r = await api("GET", `/api/gen/${id}/wav_file/`);
     if (r.status === 200 && r.j && r.j.wav_file_url) return r.j.wav_file_url;
     if (r.status !== 200 && r.status !== 404) throw new Error("wav_file " + r.status);
-    r = await api("POST", `/api/gen/${id}/convert_wav/`);
-    if (r.status >= 400) throw new Error("convert_wav " + r.status);
+    // A lost response is ambiguous: Suno may have accepted this paid conversion.
+    // Never automatically resubmit it. One retry remains available only for the
+    // explicit 401 path, which is known not to have run the conversion.
+    r = await api("POST", `/api/gen/${id}/convert_wav/`, null, 1, { retryAmbiguous: false });
+    if (r.status < 200 || r.status >= 300) throw new Error("convert_wav " + r.status + ": " + (r.j?.raw || r.j?.detail || "unexpected response"));
     for (let n = 0; n < 60; n++) {
       await stopSleep(5000);
       if (stopRequested) throw new Error("wav conversion stopped");
       r = await api("GET", `/api/gen/${id}/wav_file/`);
       if (r.status === 200 && r.j && r.j.wav_file_url) return r.j.wav_file_url;
+      if (r.status !== 200 && r.status !== 404) throw new Error("wav_file " + r.status);
     }
     throw new Error("wav conversion timed out");
   }
@@ -363,10 +498,18 @@ void (async () => {
   // MIDI: GET /api/gen/{id}/midi/ returns {"state":"running"} then
   // {"state":"complete","instruments":[{name,is_drum,notes:[{pitch,start,end,velocity}]}]}
   async function getMidiData(id) {
+    if (!operationOptions?.creditApproved) throw new Error("MIDI conversion was not approved");
     for (let n = 0; n < 60; n++) {
       const r = await api("GET", `/api/gen/${id}/midi/`);
-      if (r.status >= 400) throw new Error("midi " + r.status);
-      if (r.j.state === "complete") return r.j;
+      if (r.status !== 200) throw new Error("midi " + r.status + ": " + (r.j?.raw || r.j?.detail || "unexpected response"));
+      if (r.j?.state === "complete") {
+        if (!Array.isArray(r.j.instruments)) throw new Error("midi response missing instruments");
+        return r.j;
+      }
+      if (["failed", "error", "cancelled", "canceled"].includes(r.j?.state))
+        throw new Error("midi conversion " + r.j.state + (r.j.error ? ": " + r.j.error : ""));
+      if (r.j?.state !== "running" && r.j?.state !== "pending" && r.j?.state !== "queued")
+        throw new Error("midi returned unexpected state: " + String(r.j?.state));
       await stopSleep(5000);
       if (stopRequested) throw new Error("midi conversion stopped");
     }
@@ -379,12 +522,18 @@ void (async () => {
     const ticksPerSec = (PPQ * 120) / 60; // assume 120 BPM
     const events = [];
     const ins = data.instruments || [];
-    for (let ch = 0; ch < ins.length; ch++) {
-      const notes = ins[ch].notes || [];
-      const channel = ch & 0xf;
+    let melodicChannel = 0;
+    for (const instrument of ins) {
+      const notes = instrument.notes || [];
+      let channel;
+      if (instrument.is_drum) channel = 9; // General MIDI percussion channel 10
+      else {
+        channel = melodicChannel++ % 15;
+        if (channel >= 9) channel++;
+      }
       for (const n of notes) {
         const vel = Math.max(1, Math.min(127, Math.round((n.velocity ?? 0.7) * 127)));
-        const pitch = (n.pitch ?? 60) & 0x7f;
+        const pitch = Math.max(0, Math.min(127, Math.round(Number.isFinite(n.pitch) ? n.pitch : 60)));
         const onT = Math.max(0, Math.round((n.start ?? 0) * ticksPerSec));
         const offT = Math.max(onT + 1, Math.round((n.end ?? n.start ?? 0) * ticksPerSec));
         events.push([onT, [0x90 | channel, pitch, vel]]);
@@ -422,20 +571,70 @@ void (async () => {
     return new Blob([new Uint8Array(buf)], { type: "audio/midi" });
   }
 
-  // folder for a song is always unique: "<title> [<id8>]"
-  const folderFor = (e) => sanitize(e.title) + " [" + e.id.slice(0, 8) + "]";
+  const collisionSafeId = (entry, peers) => {
+    const short = entry.id.slice(0, 8);
+    return peers.some((candidate) => candidate.id !== entry.id && candidate.id.slice(0, 8) === short)
+      ? entry.id : short;
+  };
+  const withSuffix = (base, suffix) => {
+    const suffixChars = Array.from(suffix);
+    const room = Math.max(1, 220 - suffixChars.length);
+    const head = Array.from(base).slice(0, room).join("").replace(/[. ]+$/g, "") || "untitled";
+    return head + suffix;
+  };
+  const collisionKey = (name) => sanitize(name).normalize("NFC").toLowerCase();
+
+  // Preserve the established "<title> [<id8>]" layout unless two clips really
+  // share that output path, in which case the full IDs prevent an overwrite.
+  const folderFor = (entry) => {
+    const base = sanitize(entry.title);
+    const key = collisionKey(entry.title);
+    const peers = [...scanState.songs.values()].filter((candidate) =>
+      !candidate.isStem && !candidate.isInfill && collisionKey(candidate.title) === key
+    );
+    return withSuffix(base, " [" + collisionSafeId(entry, peers) + "]");
+  };
 
   // Suno may generate the same named stem more than once for one parent. Keep
   // the friendly name when unique, and disambiguate every member of a duplicate
   // set so reruns map each clip to the same file instead of silently skipping it.
   const stemFileBase = (entry) => {
     const base = sanitize(entry.stemName || entry.title);
+    const key = collisionKey(entry.stemName || entry.title);
     const duplicates = [...scanState.songs.values()].filter((candidate) =>
       candidate.isStem &&
       candidate.parentId === entry.parentId &&
-      sanitize(candidate.stemName || candidate.title) === base
+      collisionKey(candidate.stemName || candidate.title) === key
     );
-    return duplicates.length > 1 ? base + " [" + entry.id.slice(0, 8) + "]" : base;
+    return duplicates.length > 1
+      ? withSuffix(base, " [" + collisionSafeId(entry, duplicates) + "]") : base;
+  };
+
+  const variationFileBase = (entry) => {
+    const base = sanitize(entry.title);
+    const key = collisionKey(entry.title);
+    const duplicates = [...scanState.songs.values()].filter((candidate) =>
+      candidate.isInfill &&
+      candidate.parentId === entry.parentId &&
+      collisionKey(candidate.title) === key
+    );
+    return duplicates.length > 1
+      ? withSuffix(base, " [" + collisionSafeId(entry, duplicates) + "]") : base;
+  };
+
+  const orphanParentFolder = (entry) => {
+    const base = sanitize(entry.title);
+    const key = collisionKey(entry.title);
+    const collisions = [...scanState.songs.values()].filter((candidate) =>
+      candidate.isStem === entry.isStem &&
+      candidate.isInfill === entry.isInfill &&
+      !scanState.songs.has(candidate.parentId) &&
+      collisionKey(candidate.title) === key &&
+      candidate.parentId !== entry.parentId
+    );
+    // A parent may be absent from the selected feeds. Different absent parents
+    // must not collapse into the same legacy title-only fallback directory.
+    return collisions.length ? withSuffix(base, " [" + sanitize(entry.parentId || entry.id) + "]") : base;
   };
 
   // download() returns { files: "mp3+wav:fail+midi:skip", fails: 1 }
@@ -444,6 +643,13 @@ void (async () => {
     const clean = sanitize(title);
     const fmt = operationOptions?.formats || getFormats();
     const out = { files: [], fails: 0 };
+    const saveFallbackMp3 = async (name) => {
+      try {
+        const blob = await fetchBlob(`https://cdn1.suno.ai/${id}.mp3`);
+        saveViaDownload(name + ".mp3", blob);
+        out.files.push("mp3");
+      } catch (e) { out.fails++; out.files.push("mp3:fail"); }
+    };
     const saveMp3 = async (d, name) => {
       if (await existsInFolder(d, name + ".mp3")) out.files.push("mp3:skip");
       else {
@@ -477,31 +683,51 @@ void (async () => {
         } catch (e) { out.fails++; out.files.push("midi:fail"); }
       }
     };
-    if (isStem && dir) {
+    if (isStem) {
       const parentEntry = scanState.songs.get(parentId);
-      const parentFolder = await getOrCreateSubDir(dir, parentEntry ? folderFor(parentEntry) : clean);
-      const stemsDir = await getOrCreateSubDir(parentFolder, "stems");
       const fname = stemFileBase(entry);
-      if (fmt.mp3) await saveMp3(stemsDir, fname);
+      if (fmt.mp3) {
+        if (dir) {
+          const parentFolder = await getOrCreateSubDir(dir, parentEntry ? folderFor(parentEntry) : orphanParentFolder(entry));
+          const stemsDir = await getOrCreateSubDir(parentFolder, "stems");
+          await saveMp3(stemsDir, fname);
+        } else {
+          const parent = sanitize(parentEntry?.title || "stem");
+          await saveFallbackMp3(withSuffix(parent + " - " + fname, " [" +
+            collisionSafeId(entry, [...scanState.songs.values()]) + "]"));
+        }
+      }
       return out;
     }
-    if (entry.isInfill && dir) {
+    if (entry.isInfill) {
       // section-edit clips (e.g. "[01:55.0 - 02:18.4] {verse]") go under the
       // parent song's folder in a variations/ subfolder
       const parentEntry = scanState.songs.get(parentId);
-      const parentFolder = await getOrCreateSubDir(dir, parentEntry ? folderFor(parentEntry) : clean);
-      const varsDir = await getOrCreateSubDir(parentFolder, "variations");
-      const fname = clean;
-      if (fmt.mp3) await saveMp3(varsDir, fname);
+      if (fmt.mp3) {
+        if (dir) {
+          const parentFolder = await getOrCreateSubDir(dir, parentEntry ? folderFor(parentEntry) : orphanParentFolder(entry));
+          const varsDir = await getOrCreateSubDir(parentFolder, "variations");
+          await saveMp3(varsDir, variationFileBase(entry));
+        } else {
+          const parent = sanitize(parentEntry?.title || "variation");
+          await saveFallbackMp3(withSuffix(parent + " - " + variationFileBase(entry), " [" +
+            collisionSafeId(entry, [...scanState.songs.values()]) + "]"));
+        }
+      }
       return out;
     }
     const songDir = await getOrCreateSubDir(dir, folderFor(entry));
+    const sameTitleSongs = [...scanState.songs.values()].filter((candidate) =>
+      !candidate.isStem && !candidate.isInfill && collisionKey(candidate.title) === collisionKey(title)
+    );
+    const fallbackBase = sameTitleSongs.length > 1
+      ? withSuffix(clean, " [" + collisionSafeId(entry, sameTitleSongs) + "]") : clean;
     if (fmt.mp3) {
       if (dir && await existsInFolder(songDir, clean + ".mp3")) out.files.push("mp3:skip");
       else if (!dir) {
         try {
           const blob = await fetchBlob(`https://cdn1.suno.ai/${id}.mp3`);
-          saveViaDownload(clean + ".mp3", blob);
+          saveViaDownload(fallbackBase + ".mp3", blob);
           out.files.push("mp3");
         } catch (e) { out.fails++; out.files.push("mp3:fail"); }
       } else await saveMp3(songDir, clean);
@@ -512,12 +738,12 @@ void (async () => {
         try {
           const url = await getWavUrl(id);
           const blob = await fetchBlob(url);
-          saveViaDownload(clean + ".wav", blob);
+          saveViaDownload(fallbackBase + ".wav", blob);
           out.files.push("wav");
         } catch (e) { out.fails++; out.files.push("wav:fail"); }
       } else await saveWav(songDir, clean);
     }
-    if (fmt.midi) await saveMidi(songDir, clean);
+    if (fmt.midi) await saveMidi(songDir, dir ? clean : fallbackBase);
     return out;
   }
 
@@ -529,12 +755,29 @@ void (async () => {
     try {
       const handle = await dir.getFileHandle(CACHE_NAME);
       const text = await (await handle.getFile()).text();
-      return JSON.parse(text);
-    } catch {}
-    return null;
+      const cached = JSON.parse(text);
+      if (!cached || typeof cached !== "object" || Array.isArray(cached))
+        throw new Error("cache root is not an object");
+      if (cached.songs !== undefined && !Array.isArray(cached.songs))
+        throw new Error("cache songs field is not an array");
+      if (cached.seenIds !== undefined && !Array.isArray(cached.seenIds))
+        throw new Error("cache seenIds field is not an array");
+      if ((cached.songs || []).some((song) => !song || typeof song !== "object" || typeof song.id !== "string"))
+        throw new Error("cache contains an invalid song entry");
+      if ((cached.seenIds || []).some((id) => typeof id !== "string"))
+        throw new Error("cache contains an invalid seen ID");
+      return cached;
+    } catch (err) {
+      // Missing caches are normal, including for caches written by older runs.
+      // Parse, permission, and I/O failures must be visible so a valid resume
+      // cache is never silently replaced by a new partial scan.
+      if (err?.name === "NotFoundError") return null;
+      throw new Error("could not read " + CACHE_NAME + ": " + (err?.message || err));
+    }
   }
   async function persistCache(dir) {
     if (!dir) return true;
+    if (destroyed) return false;
     const data = JSON.stringify({
       savedAt: Date.now(),
       libCursor: scanState.libCursor,
@@ -549,6 +792,7 @@ void (async () => {
     // Recover the queue after an earlier rejected write, but let this write's
     // error reach its caller so the UI never claims unsaved progress is safe.
     persistChain = persistChain.catch(() => {}).then(async () => {
+      if (destroyed) return;
       let w = null;
       try {
         const handle = await dir.getFileHandle(CACHE_NAME, { create: true });
@@ -580,6 +824,17 @@ void (async () => {
     scanState.scanned = cached.scanned || 0;
   }
 
+  function resetScanState() {
+    scanState.songs = new Map();
+    scanState.seenIds = new Set();
+    scanState.libCursor = null;
+    scanState.wsCursor = null;
+    scanState.libDone = false;
+    scanState.wsDone = false;
+    scanState.stemsIncluded = false;
+    scanState.scanned = 0;
+  }
+
   async function enumerateSongs(dir) {
     setStatus("Enumerating songs...");
     scanState.stemsIncluded = scanState.stemsIncluded || includeStems();
@@ -602,9 +857,12 @@ void (async () => {
   let songs = [];
   let rescan = false;
   let pickedDir = null;
+  let songsDir = null;
+  let songsIncludedStems = null;
 
   async function ensureSongs(dir) {
-    if (songs.length && !rescan) return true;
+    const wantsStems = includeStems();
+    if (songs.length && !rescan && songsDir === dir && songsIncludedStems === wantsStems) return true;
     const cached = await readCache(dir);
     const cacheIncludedStems = cached && (typeof cached.stemsIncluded === "boolean"
       ? cached.stemsIncluded
@@ -615,12 +873,15 @@ void (async () => {
       songs = [...scanState.songs.values()];
       if (!includeStems()) songs = songs.filter((s) => !s.isStem);
       if (LIMIT > 0) songs = songs.slice(0, LIMIT);
+      songsDir = dir;
+      songsIncludedStems = wantsStems;
       setStatus(`Using cache: ${songs.length} songs.\nPress Start to download.`);
       return true;
     }
     stopRequested = false;
     earlyStop = false; // stems newly requested -> must walk the full feed once
-    restoreScanState(cached);
+    if (cached) restoreScanState(cached);
+    else resetScanState();
     if (needStemRescan) {
       // force a full re-walk so stems get collected (done flags from cache would skip it)
       scanState.songs = new Map();
@@ -634,6 +895,8 @@ void (async () => {
     const { songs: fresh } = await enumerateSongs(dir);
     if (stopRequested) { setStatus("Scan stopped. Progress saved - rerun to resume."); return false; }
     songs = fresh;
+    songsDir = dir;
+    songsIncludedStems = wantsStems;
     if (!songs.length) { setStatus("No songs found."); return false; }
     setStatus(`Found ${songs.length} songs (including stems).\nPress Start to download.`);
     return true;
@@ -643,7 +906,10 @@ void (async () => {
   stopBtn.textContent = "Stop";
   stopBtn.style.cssText = "width:100%;padding:6px;margin-top:8px;border:0;border-radius:6px;background:#555;color:#fff;font-weight:600;cursor:pointer";
   stopBtn.disabled = true;
-  stopBtn.addEventListener("click", () => { stopRequested = true; });
+  stopBtn.addEventListener("click", () => {
+    stopRequested = true;
+    operationController?.abort();
+  });
   panel.appendChild(stopBtn);
 
   const startBtn = btn;
@@ -669,7 +935,14 @@ void (async () => {
     if (!usePicker || busy) return;
     setBusy(true);
     try {
-      pickedDir = await window.showDirectoryPicker({ mode: "readwrite" });
+      const dir = await window.showDirectoryPicker({ mode: "readwrite" });
+      if (destroyed) return;
+      if (dir !== pickedDir) {
+        songs = [];
+        songsDir = null;
+        songsIncludedStems = null;
+      }
+      pickedDir = dir;
       setStatus("Folder selected. Press Start to download.");
     } catch (e) {
       setStatus("Folder picker cancelled.");
@@ -684,14 +957,24 @@ void (async () => {
     operationOptions = {
       formats: getFormats(),
       includeStems: stemsCheck.checked || INCLUDE_STEMS,
+      creditApproved: false,
     };
+    if (!operationOptions.formats.mp3 && !operationOptions.formats.wav && !operationOptions.formats.midi) {
+      operationOptions = null;
+      setStatus("Select at least one format before starting.");
+      return;
+    }
+    operationController = new AbortController();
     setBusy(true);
     try {
       let dir = pickedDir;
       if (!dir && usePicker) {
         try { dir = await window.showDirectoryPicker({ mode: "readwrite" }); }
         catch (e) { setStatus("Folder picker cancelled."); return; }
+        if (destroyed) return;
+        pickedDir = dir;
       }
+      if (stopRequested) { setStatus("Stopped before scanning."); return; }
       if (!(await ensureSongs(dir))) return;
       const fmtNow = operationOptions.formats;
       if (fmtNow.wav || fmtNow.midi) {
@@ -703,6 +986,7 @@ void (async () => {
           " use your Suno credits and can drain your balance on a large library.\n\n" +
           "MP3 downloads and already-generated stem downloads are free.\n\nContinue?"
         )) { setStatus("Cancelled."); return; }
+        operationOptions.creditApproved = true;
       }
       let ok = 0, failed = 0, skipped = 0;
       for (let i = 0; i < songs.length; i++) {
@@ -732,6 +1016,8 @@ void (async () => {
       setStatus("Error: " + (err && err.message ? err.message : err));
       startBtn.textContent = "Start";
     } finally {
+      operationController?.abort();
+      operationController = null;
       stopRequested = false;
       operationOptions = null;
       setBusy(false);
@@ -750,27 +1036,28 @@ void (async () => {
         formats: getFormats(),
         includeStems: stemsCheck.checked || INCLUDE_STEMS,
       };
+      operationController = new AbortController();
       setBusy(true);
       rescan = true;
       songs = [];
+      songsDir = null;
+      songsIncludedStems = null;
       stopRequested = false;
       setStatus("Re-scanning...");
       try {
         const dir = await window.showDirectoryPicker({ mode: "readwrite" });
+        if (destroyed) return;
+        if (stopRequested) { setStatus("Re-scan stopped before scanning."); return; }
         pickedDir = dir;
         const cached = await readCache(dir);
-        scanState.songs = new Map();
-        scanState.seenIds = new Set();
-        scanState.libCursor = null;
-        scanState.wsCursor = null;
-        scanState.libDone = false;
-        scanState.wsDone = false;
+        resetScanState();
         scanState.stemsIncluded = !!(cached && (typeof cached.stemsIncluded === "boolean"
           ? cached.stemsIncluded
           : (cached.songs || []).some((s) => s.isStem)));
         // If this cache predates a stem-inclusive scan, walk every page once;
         // seenIds also contains excluded stems and is not a safe early boundary.
         earlyStop = scanState.stemsIncluded || !includeStems();
+        knownBeforeRescan = new Set(cached?.seenIds || []);
         if (cached && cached.songs) {
           // seed from cache so the early-stop boundary knows what's already seen,
           // but keep done flags false so feeds actually re-walk
@@ -785,15 +1072,21 @@ void (async () => {
           return;
         }
         songs = fresh;
+        songsDir = dir;
+        songsIncludedStems = includeStems();
         rescan = false;
         earlyStop = false;
+        knownBeforeRescan = new Set();
         setStatus(`Re-scan complete: ${songs.length} songs.\nClick "Start" to download.`);
       } catch (e) {
         rescan = false;
         earlyStop = false;
         setStatus("Re-scan failed or cancelled: " + e.message);
       } finally {
+        operationController?.abort();
+        operationController = null;
         operationOptions = null;
+        knownBeforeRescan = new Set();
         stopRequested = false;
         setBusy(false);
       }
@@ -804,5 +1097,7 @@ void (async () => {
   for (const cb of [mp3Check, wavCheck, midiCheck, stemsCheck]) {
     cb.addEventListener("change", refreshCredits);
   }
-  refreshCredits().catch(() => {});
+  refreshCredits().catch((err) => {
+    if (!destroyed) creditsBox.textContent = "Could not read credit balance: " + (err?.message || err);
+  });
 })();
