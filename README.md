@@ -6,7 +6,7 @@ Download all your songs from Suno as MP3, WAV, and MIDI with one paste into the 
 
 - **Downloads your full Suno library + workspace** (auto-detected via Suno's own feed)
 - **MP3 and/or WAV and/or MIDI** — tick whichever you want (WAV/MIDI use Suno's converters, so they're slower per song)
-- **Stems support** — optionally download your already-generated stems into each song's `stems/` folder (`Vocals.mp3`, `Drums.mp3`, ...)
+- **Stems support** — optionally download your already-generated stems into each song's `stems/` folder (`Vocals.mp3`, `Drums.mp3`, ...); repeated generations get a short clip ID so none overwrite each other
 - **Section-edit clips grouped** — Suno's "replace section" variations (e.g. `[01:55.0 - 02:18.4] {verse]`) are filed under their parent song's `variations/` folder
 - **Per-song folders** — one unique folder per song (`<title> [<id>]/`), so duplicate titles never collide
 - **Resumable** — stop any time and rerun to continue where you left off; already-downloaded files are skipped
@@ -53,6 +53,7 @@ Download all your songs from Suno as MP3, WAV, and MIDI with one paste into the 
     My Song.mid
     stems/
       Vocals.mp3
+      Vocals [f6e7d8c9].mp3       (when the same stem was generated more than once)
       Drums.mp3
       Bass.mp3
       ...

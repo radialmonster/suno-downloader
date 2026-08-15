@@ -31,6 +31,11 @@
  * picker API, so on those browsers it falls back to normal per-file downloads.
  */
 void (async () => {
+  const INSTANCE_KEY = "__sunoBulkDownloaderInstance";
+  const previousInstance = window[INSTANCE_KEY];
+  if (previousInstance && typeof previousInstance.destroy === "function") previousInstance.destroy();
+  document.getElementById("suno-bulk-downloader-panel")?.remove();
+
   const FORMAT = "mp3"; // 'mp3', 'wav', or 'both'
   const LIMIT = 0; // 0 = all songs, or N = first N songs
   const INCLUDE_LIBRARY = true; // your Suno library (created + liked songs)
@@ -44,7 +49,10 @@ void (async () => {
     name.replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_").replace(/\s+/g, " ").trim() || "untitled";
 
   // ---------- small floating panel ----------
+  let stopRequested = false;
+  let destroyed = false;
   const panel = document.createElement("div");
+  panel.id = "suno-bulk-downloader-panel";
   Object.assign(panel.style, {
     position: "fixed", top: "16px", right: "16px", zIndex: "2147483647",
     background: "#1a1a1a", color: "#fff", font: "13px/1.5 system-ui, sans-serif",
@@ -78,8 +86,9 @@ void (async () => {
   const midiCheck = panel.querySelector("#suno-dl-midi");
   const stemsCheck = panel.querySelector("#suno-dl-stems");
   const creditsBox = panel.querySelector("#suno-dl-credits");
-  const setStatus = (t) => (status.textContent = t);
-  const includeStems = () => stemsCheck.checked || INCLUDE_STEMS;
+  const setStatus = (t) => { if (!destroyed) status.textContent = t; };
+  let operationOptions = null;
+  const includeStems = () => operationOptions ? operationOptions.includeStems : (stemsCheck.checked || INCLUDE_STEMS);
   mp3Check.checked = FORMAT === "mp3" || FORMAT === "both";
   wavCheck.checked = FORMAT === "wav" || FORMAT === "both";
   const getFormats = () => ({
@@ -87,6 +96,14 @@ void (async () => {
     wav: wavCheck.checked,
     midi: midiCheck.checked,
   });
+  const instance = {
+    destroy() {
+      destroyed = true;
+      stopRequested = true;
+      panel.remove();
+    },
+  };
+  window[INSTANCE_KEY] = instance;
 
   // show current credit balance and estimated cost of the selected options
   async function refreshCredits() {
@@ -118,11 +135,23 @@ void (async () => {
   const api = async (method, p, body, retries = 5) => {
     let refreshToken = false;
     for (let i = 0; i <= retries; i++) {
-      const res = await fetch(API + p, {
-        method,
-        headers: await headers(refreshToken),
-        body: body ? JSON.stringify(body) : undefined,
-      });
+      let res;
+      try {
+        res = await fetch(API + p, {
+          method,
+          headers: await headers(refreshToken),
+          body: body ? JSON.stringify(body) : undefined,
+        });
+      } catch (err) {
+        if (i >= retries) {
+          return { status: 0, j: { raw: "network request failed after retries: " + (err?.message || err) } };
+        }
+        const wait = Math.min(1000 * Math.pow(2, i), 30000);
+        setStatus("Network error - retrying in " + (wait / 1000) + "s...");
+        await stopSleep(wait);
+        if (stopRequested) return { status: 0, j: { raw: "request stopped" } };
+        continue;
+      }
       refreshToken = false;
       if (res.status === 401 && i < retries) { refreshToken = true; continue; } // token expired -> refresh
       if (res.status === 429 && i < retries) {
@@ -163,11 +192,18 @@ void (async () => {
     return raw.replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_").replace(/\s+/g, "_") || null;
   };
 
+  const stemParentId = (c) => {
+    const m = c.metadata || {};
+    if (m.stem_from_id) return m.stem_from_id;
+    const historyParent = (m.history || []).find((h) => h && h.stem_from_id);
+    return historyParent ? historyParent.stem_from_id : null;
+  };
+
   const toEntry = (c) => {
     const e = { id: c.id, title: (c.title || "untitled").trim() };
     if (isStem(c)) {
       e.isStem = true;
-      e.parentId = c.metadata?.stem_from_id || null;
+      e.parentId = stemParentId(c);
       e.stemName = stemName(c);
     } else {
       const p = infillParentId(c);
@@ -176,7 +212,6 @@ void (async () => {
     return e;
   };
 
-  let stopRequested = false;
   const stopSleep = async (ms) => {
     for (let waited = 0; waited < ms && !stopRequested; waited += 100) await sleep(100);
   };
@@ -189,6 +224,7 @@ void (async () => {
     wsCursor: null,
     libDone: false,
     wsDone: false,
+    stemsIncluded: false,
     scanned: 0,
   };
 
@@ -389,11 +425,24 @@ void (async () => {
   // folder for a song is always unique: "<title> [<id8>]"
   const folderFor = (e) => sanitize(e.title) + " [" + e.id.slice(0, 8) + "]";
 
+  // Suno may generate the same named stem more than once for one parent. Keep
+  // the friendly name when unique, and disambiguate every member of a duplicate
+  // set so reruns map each clip to the same file instead of silently skipping it.
+  const stemFileBase = (entry) => {
+    const base = sanitize(entry.stemName || entry.title);
+    const duplicates = [...scanState.songs.values()].filter((candidate) =>
+      candidate.isStem &&
+      candidate.parentId === entry.parentId &&
+      sanitize(candidate.stemName || candidate.title) === base
+    );
+    return duplicates.length > 1 ? base + " [" + entry.id.slice(0, 8) + "]" : base;
+  };
+
   // download() returns { files: "mp3+wav:fail+midi:skip", fails: 1 }
   async function download(entry, dir) {
-    const { id, title, isStem, parentId, stemName } = entry;
+    const { id, title, isStem, parentId } = entry;
     const clean = sanitize(title);
-    const fmt = getFormats();
+    const fmt = operationOptions?.formats || getFormats();
     const out = { files: [], fails: 0 };
     const saveMp3 = async (d, name) => {
       if (await existsInFolder(d, name + ".mp3")) out.files.push("mp3:skip");
@@ -432,7 +481,7 @@ void (async () => {
       const parentEntry = scanState.songs.get(parentId);
       const parentFolder = await getOrCreateSubDir(dir, parentEntry ? folderFor(parentEntry) : clean);
       const stemsDir = await getOrCreateSubDir(parentFolder, "stems");
-      const fname = stemName || clean;
+      const fname = stemFileBase(entry);
       if (fmt.mp3) await saveMp3(stemsDir, fname);
       return out;
     }
@@ -485,26 +534,34 @@ void (async () => {
     return null;
   }
   async function persistCache(dir) {
-    if (!dir) return;
+    if (!dir) return true;
     const data = JSON.stringify({
       savedAt: Date.now(),
       libCursor: scanState.libCursor,
       wsCursor: scanState.wsCursor,
       libDone: scanState.libDone,
       wsDone: scanState.wsDone,
+      stemsIncluded: scanState.stemsIncluded,
       songs: [...scanState.songs.values()],
       seenIds: [...scanState.seenIds],
       scanned: scanState.scanned,
     }, null, 2);
-    persistChain = persistChain.then(async () => {
+    // Recover the queue after an earlier rejected write, but let this write's
+    // error reach its caller so the UI never claims unsaved progress is safe.
+    persistChain = persistChain.catch(() => {}).then(async () => {
+      let w = null;
       try {
         const handle = await dir.getFileHandle(CACHE_NAME, { create: true });
-        const w = await handle.createWritable();
+        w = await handle.createWritable();
         await w.write(data);
         await w.close();
-      } catch {}
+      } catch (err) {
+        if (w) try { await w.abort(); } catch {}
+        throw new Error("could not save " + CACHE_NAME + ": " + (err?.message || err));
+      }
     });
-    return persistChain;
+    await persistChain;
+    return true;
   }
 
   function restoreScanState(cached) {
@@ -515,16 +572,24 @@ void (async () => {
     scanState.wsCursor = cached.wsCursor ?? null;
     scanState.libDone = !!cached.libDone;
     scanState.wsDone = !!cached.wsDone;
+    // Old caches did not record this explicitly. Existing stem entries prove
+    // that stems were included; zero-stem old caches get one compatibility scan.
+    scanState.stemsIncluded = typeof cached.stemsIncluded === "boolean"
+      ? cached.stemsIncluded
+      : (cached.songs || []).some((s) => s.isStem);
     scanState.scanned = cached.scanned || 0;
   }
 
   async function enumerateSongs(dir) {
     setStatus("Enumerating songs...");
+    scanState.stemsIncluded = scanState.stemsIncluded || includeStems();
     const onProgress = (msg) => setStatus(msg);
-    await Promise.all([
+    const scans = await Promise.allSettled([
       getLibrary(dir, onProgress, persistCache),
       getWorkspace(dir, onProgress, persistCache),
     ]);
+    const failedScan = scans.find((result) => result.status === "rejected");
+    if (failedScan) throw failedScan.reason;
     await persistCache(dir);
     let out = [...scanState.songs.values()];
     if (!includeStems()) out = out.filter((s) => !s.isStem);
@@ -541,8 +606,10 @@ void (async () => {
   async function ensureSongs(dir) {
     if (songs.length && !rescan) return true;
     const cached = await readCache(dir);
-    const cacheHasStems = (cached?.songs || []).some((s) => s.isStem);
-    const needStemRescan = cached && includeStems() && !cacheHasStems;
+    const cacheIncludedStems = cached && (typeof cached.stemsIncluded === "boolean"
+      ? cached.stemsIncluded
+      : (cached.songs || []).some((s) => s.isStem));
+    const needStemRescan = cached && includeStems() && !cacheIncludedStems;
     if (cached && !rescan && !needStemRescan && cached.libDone && cached.wsDone) {
       restoreScanState(cached);
       songs = [...scanState.songs.values()];
@@ -562,6 +629,7 @@ void (async () => {
       scanState.wsCursor = null;
       scanState.libDone = false;
       scanState.wsDone = false;
+      scanState.stemsIncluded = true;
     }
     const { songs: fresh } = await enumerateSongs(dir);
     if (stopRequested) { setStatus("Scan stopped. Progress saved - rerun to resume."); return false; }
@@ -579,31 +647,53 @@ void (async () => {
   panel.appendChild(stopBtn);
 
   const startBtn = btn;
-  const setBusy = (busy) => {
-    startBtn.disabled = busy;
-    stopBtn.disabled = !busy;
-    pickBtn.disabled = busy;
+  let busy = false;
+  let rescanLink = null;
+  const setBusy = (isBusy) => {
+    // Set the guard before any awaited picker/API call so rapid clicks cannot
+    // start overlapping scans or downloads.
+    busy = isBusy;
+    startBtn.disabled = isBusy;
+    stopBtn.disabled = !isBusy;
+    pickBtn.disabled = isBusy;
+    for (const cb of [mp3Check, wavCheck, midiCheck, stemsCheck]) cb.disabled = isBusy;
+    if (rescanLink) {
+      rescanLink.setAttribute("aria-disabled", String(isBusy));
+      rescanLink.style.pointerEvents = isBusy ? "none" : "auto";
+      rescanLink.style.opacity = isBusy ? "0.5" : "1";
+    }
   };
 
   // choose folder only (does not start)
   pickBtn.addEventListener("click", async () => {
-    if (!usePicker) return;
-    try { pickedDir = await window.showDirectoryPicker({ mode: "readwrite" }); }
-    catch (e) { setStatus("Folder picker cancelled."); return; }
-    setStatus("Folder selected. Press Start to download.");
+    if (!usePicker || busy) return;
+    setBusy(true);
+    try {
+      pickedDir = await window.showDirectoryPicker({ mode: "readwrite" });
+      setStatus("Folder selected. Press Start to download.");
+    } catch (e) {
+      setStatus("Folder picker cancelled.");
+    } finally {
+      setBusy(false);
+    }
   });
 
   // start downloads (scans first if no cache)
   startBtn.addEventListener("click", async () => {
-    let dir = pickedDir;
-    if (!dir && usePicker) {
-      try { dir = await window.showDirectoryPicker({ mode: "readwrite" }); }
-      catch (e) { setStatus("Folder picker cancelled."); return; }
-    }
+    if (busy) return;
+    operationOptions = {
+      formats: getFormats(),
+      includeStems: stemsCheck.checked || INCLUDE_STEMS,
+    };
     setBusy(true);
     try {
+      let dir = pickedDir;
+      if (!dir && usePicker) {
+        try { dir = await window.showDirectoryPicker({ mode: "readwrite" }); }
+        catch (e) { setStatus("Folder picker cancelled."); return; }
+      }
       if (!(await ensureSongs(dir))) return;
-      const fmtNow = getFormats();
+      const fmtNow = operationOptions.formats;
       if (fmtNow.wav || fmtNow.midi) {
         const parts = [];
         if (fmtNow.wav) parts.push("WAV conversion");
@@ -643,6 +733,7 @@ void (async () => {
       startBtn.textContent = "Start";
     } finally {
       stopRequested = false;
+      operationOptions = null;
       setBusy(false);
     }
   });
@@ -650,9 +741,16 @@ void (async () => {
   // small re-scan link so new songs get picked up without deleting the cache
   if (usePicker) {
     const link = document.createElement("a");
+    rescanLink = link;
     link.textContent = "Re-scan for new songs";
     link.style.cssText = "display:block;margin-top:8px;color:#ff6b9d;cursor:pointer;font-size:12px;text-decoration:underline";
     link.addEventListener("click", async () => {
+      if (busy) return;
+      operationOptions = {
+        formats: getFormats(),
+        includeStems: stemsCheck.checked || INCLUDE_STEMS,
+      };
+      setBusy(true);
       rescan = true;
       songs = [];
       stopRequested = false;
@@ -667,7 +765,12 @@ void (async () => {
         scanState.wsCursor = null;
         scanState.libDone = false;
         scanState.wsDone = false;
-        earlyStop = true;
+        scanState.stemsIncluded = !!(cached && (typeof cached.stemsIncluded === "boolean"
+          ? cached.stemsIncluded
+          : (cached.songs || []).some((s) => s.isStem)));
+        // If this cache predates a stem-inclusive scan, walk every page once;
+        // seenIds also contains excluded stems and is not a safe early boundary.
+        earlyStop = scanState.stemsIncluded || !includeStems();
         if (cached && cached.songs) {
           // seed from cache so the early-stop boundary knows what's already seen,
           // but keep done flags false so feeds actually re-walk
@@ -675,6 +778,12 @@ void (async () => {
           for (const id of cached.seenIds || []) scanState.seenIds.add(id);
         }
         const { songs: fresh } = await enumerateSongs(dir);
+        if (stopRequested) {
+          rescan = false;
+          earlyStop = false;
+          setStatus("Re-scan stopped. Progress saved - rerun to resume.");
+          return;
+        }
         songs = fresh;
         rescan = false;
         earlyStop = false;
@@ -682,7 +791,11 @@ void (async () => {
       } catch (e) {
         rescan = false;
         earlyStop = false;
-        setStatus("Re-scan cancelled: " + e.message);
+        setStatus("Re-scan failed or cancelled: " + e.message);
+      } finally {
+        operationOptions = null;
+        stopRequested = false;
+        setBusy(false);
       }
     });
     panel.appendChild(link);
