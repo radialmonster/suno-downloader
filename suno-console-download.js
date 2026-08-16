@@ -502,7 +502,7 @@ void (async () => {
     return cached.includeLibrary === INCLUDE_LIBRARY && cached.includeWorkspace === INCLUDE_WORKSPACE;
   };
 
-  async function getLibrary(dir, onProgress, persist) {
+  async function getLibrary(dir, persist) {
     if (!INCLUDE_LIBRARY || scanState.libDone) return;
     let cursor = scanState.libCursor;
     let page = 0;
@@ -568,7 +568,7 @@ void (async () => {
     } while (cursor);
   }
 
-  async function getWorkspace(dir, onProgress, persist) {
+  async function getWorkspace(dir, persist) {
     if (!INCLUDE_WORKSPACE || scanState.wsDone) return;
     let cursor = scanState.wsCursor;
     let page = 0;
@@ -1606,15 +1606,14 @@ void (async () => {
     // stems. Resuming a partial stem scan with stems disabled must downgrade it;
     // otherwise a later stem run would trust an incomplete stem collection.
     scanState.stemsIncluded = includeStems();
-    const onProgress = (msg) => setStatus(msg);
     peerScanFailed = false;
     const guardedScan = async (scan) => {
       try { await scan(); }
       catch (error) { peerScanFailed = true; throw error; }
     };
     const scans = await Promise.allSettled([
-      guardedScan(() => getLibrary(dir, onProgress, persistCache)),
-      guardedScan(() => getWorkspace(dir, onProgress, persistCache)),
+      guardedScan(() => getLibrary(dir, persistCache)),
+      guardedScan(() => getWorkspace(dir, persistCache)),
     ]);
     peerScanFailed = false;
     const failedScan = scans.find((result) => result.status === "rejected");
