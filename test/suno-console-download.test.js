@@ -975,6 +975,61 @@ test("Stop cancels a rate-limit retry before another request", async () => {
   assert.equal(feedAttempts, 1);
 });
 
+test("Stop during a complete cache read prevents paid confirmation and downloads", async () => {
+  let releaseRead;
+  let readStarted = false;
+  const readGate = new Promise((resolve) => { releaseRead = resolve; });
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "cachedstop001", title: "Cached stop" },
+  ]));
+  const cacheFile = directory.files.get("suno-cache.json");
+  const originalGetFile = cacheFile.getFile.bind(cacheFile);
+  cacheFile.getFile = async () => {
+    readStarted = true;
+    await readGate;
+    return originalGetFile();
+  };
+  const runtime = createRuntime({ directory });
+  runtime.run();
+  runtime.element("suno-dl-mp3").checked = false;
+  runtime.element("suno-dl-wav").checked = true;
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => readStarted, "cache read did not start");
+  runtime.document.walk().find((element) => element.textContent === "Stop").click();
+  releaseRead();
+  await waitFor(() => !runtime.element("suno-dl-btn").disabled, "stopped cache read did not restore the UI");
+  assert.equal(runtime.status(), "Stopped before scanning.");
+  assert.equal(runtime.confirms.length, 0, "paid confirmation appeared after Stop");
+  assert.equal(runtime.calls.some((call) => /\/api\/(?:feed|project|gen)\//.test(call.url)), false);
+  assert.equal(runtime.calls.some((call) => /cdn/i.test(call.url)), false);
+});
+
+test("Stop during a missing cache probe does not resume an aborted scan", async () => {
+  let releaseProbe;
+  let probeStarted = false;
+  const probeGate = new Promise((resolve) => { releaseProbe = resolve; });
+  class SlowMissingCacheDirectory extends MemoryDirectory {
+    async getFileHandle(name, options = {}) {
+      if (name === "suno-cache.json" && !options.create) {
+        probeStarted = true;
+        await probeGate;
+      }
+      return super.getFileHandle(name, options);
+    }
+  }
+  const runtime = createRuntime({ directory: new SlowMissingCacheDirectory() });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => probeStarted, "cache probe did not start");
+  runtime.document.walk().find((element) => element.textContent === "Stop").click();
+  releaseProbe();
+  await waitFor(() => !runtime.element("suno-dl-btn").disabled, "stopped cache probe did not restore the UI");
+  assert.equal(runtime.status(), "Stopped before scanning.");
+  assert.equal(runtime.calls.some((call) => /\/api\/(?:feed\/v3|project\/feed)/.test(call.url)), false,
+    "feed scan started after Stop");
+  assert.equal(runtime.calls.some((call) => /cdn/i.test(call.url)), false);
+});
+
 test("duplicate stems and variations receive stable collision-free names", async () => {
   const songs = [
     { id: "parent000001", title: "Parent" },
@@ -1440,6 +1495,36 @@ test("CDN retries are finite and recover a transient download failure", async ()
   await waitFor(() => /^Done\./.test(runtime.status()), "CDN retry test did not finish", 3000);
   assert.equal(cdnAttempts, 3);
   assert.match(runtime.status(), /1 downloaded, 0 skipped, 0 failed/);
+});
+
+test("encoded media does not compare decoded bytes with encoded Content-Length", async () => {
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "encodedmp3001", title: "Encoded MP3" },
+  ]));
+  const runtime = createRuntime({
+    directory,
+    fetch: async (url) => {
+      url = String(url);
+      runtime.calls.push({ url });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 1 });
+      if (url.startsWith("https://cdn1.suno.ai/")) {
+        return new Response(new Blob([MP3_BYTES]), {
+          status: 200,
+          headers: {
+            "content-type": "audio/mpeg",
+            "content-length": String(MP3_BYTES.length + 17),
+            "content-encoding": "gzip",
+          },
+        });
+      }
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "encoded MP3 download did not finish", 3000);
+  assert.match(runtime.status(), /1 downloaded, 0 skipped, 0 failed/);
+  assert.ok(directory.paths().some((name) => name.endsWith(".mp3")));
 });
 
 test("an existing-file probe failure cannot overwrite a possibly existing download", async () => {

@@ -761,8 +761,13 @@ void (async () => {
         }
         const blob = await Promise.race([res.blob(), requestAborted]);
         const expected = Number(res.headers.get("content-length"));
+        const contentEncoding = (res.headers.get("content-encoding") || "").trim().toLowerCase();
         const contentType = (res.headers.get("content-type") || "").toLowerCase();
-        if (!blob.size || (Number.isFinite(expected) && expected > 0 && blob.size !== expected))
+        // Fetch exposes decoded response bytes, while Content-Length can describe
+        // the encoded transfer. Compare sizes only when no content coding changed
+        // the representation delivered to Blob.
+        const comparableLength = !contentEncoding || contentEncoding === "identity";
+        if (!blob.size || (comparableLength && Number.isFinite(expected) && expected > 0 && blob.size !== expected))
           throw new Error("incomplete response while fetching " + url);
         if (/^(text\/|application\/(?:json|xml))/.test(contentType)) {
           const error = new Error("unexpected " + contentType + " response while fetching " + url);
@@ -1397,6 +1402,10 @@ void (async () => {
     const wantsStems = includeStems();
     if (songs.length && !rescan && songsDir === dir && songsIncludedStems === wantsStems) return true;
     const cached = await readCache(dir);
+    if (operationCancelled()) {
+      setStatus("Stopped before scanning.");
+      return false;
+    }
     const cacheIncludedStems = cached && (typeof cached.stemsIncluded === "boolean"
       ? cached.stemsIncluded
       : (cached.songs || []).some((s) => s.isStem));
@@ -1405,6 +1414,10 @@ void (async () => {
     if (cached && !rescan && !needStemRescan && !needFeedRescan && cached.libDone && cached.wsDone) {
       restoreScanState(cached);
       if (assignStableOutputBases()) await persistCache(dir);
+      if (operationCancelled()) {
+        setStatus("Stopped before downloading.");
+        return false;
+      }
       songs = [...scanState.songs.values()];
       if (!includeStems()) songs = songs.filter((s) => !s.isStem);
       if (LIMIT > 0) songs = songs.slice(0, LIMIT);
@@ -1413,7 +1426,6 @@ void (async () => {
       setStatus(`Using cache: ${songs.length} download items.\nStarting download...`);
       return true;
     }
-    stopRequested = false;
     earlyStopLibrary = false; // normal/partial-cache scans resume from their saved cursors
     earlyStopWorkspace = false;
     if (cached && !needFeedRescan) restoreScanState(cached);
@@ -1520,6 +1532,7 @@ void (async () => {
       }
       if (stopRequested) { setStatus("Stopped before scanning."); return; }
       if (!(await ensureSongs(dir))) return;
+      if (operationCancelled()) { setStatus("Stopped before downloading."); return; }
       const fmtNow = operationOptions.formats;
       if (fmtNow.wav || fmtNow.midi) {
         const parts = [];
