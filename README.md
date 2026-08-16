@@ -7,7 +7,7 @@ Download your completed Suno clips as MP3, WAV, and MIDI with one paste into the
 - **Downloads completed clips from your Suno library + workspace** (auto-detected via Suno's own feeds)
 - **MP3 and/or WAV and/or MIDI** — tick whichever you want (missing WAV files and MIDI data may require Suno's converters, so they're slower per song)
 - **Stems support** — optionally download your already-generated stems as MP3s into each song's `stems/` folder (`Vocals.mp3`, `Drums.mp3`, ...), regardless of the full-song format selection; repeated names get stable clip-ID suffixes as needed so none overwrite each other or change names on later re-scans
-- **Section-edit clips grouped** — Suno's "replace section" variations (e.g. `[01:55.0 - 02:18.4] {verse]`) are filed under their parent song's `variations/` folder
+- **Section-edit clips grouped** — Suno's "replace section" variations (e.g. `[01:55.0 - 02:18.4] {verse]`) are available as existing MP3s and filed under their parent song's `variations/` folder; WAV/MIDI-only selections skip them
 - **Per-song folders** — one unique folder per song (`<title> [<id>]/`), so duplicate titles never collide; unsafe or overlong filename characters are normalized for portability (with the Chrome/Edge folder picker)
 - **Resumable folder downloads** — stop any time and rerun to continue where you left off; already-downloaded files are skipped
 - **Cached, resumable scans** — `suno-cache.json` remembers completed scans and partial cursors, avoiding unnecessary feed requests on reruns
@@ -82,7 +82,7 @@ If you set the source-level `LIMIT` option above zero, the downloader stops requ
 
 - Songs downloaded with this tool may not be eligible for your commercial use. It is **your responsibility** to follow Suno's Terms of Service and any applicable license terms for the music you download.
 - This project is not affiliated with, endorsed by, or connected to Suno. It is an independent, personal-use tool that talks to the same API endpoints used by the Suno web app, from your own logged-in browser session.
-- No credentials ever leave your browser. Authenticated API requests go only to Suno; media downloads use HTTPS audio URLs returned by Suno's feeds (normally Suno's CDN) and do not include your authorization header.
+- No credentials are sent to this project or unrelated third parties. Authenticated API requests send your session token only to Suno; media downloads use HTTPS audio URLs returned by Suno's feeds (normally Suno's CDN) and do not include your authorization header.
 
 ## Requirements
 

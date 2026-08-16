@@ -2837,6 +2837,126 @@ test("an existing nonempty format file is skipped without a media request", asyn
   assert.equal(runtime.calls.some((call) => /\.mp3(?:\?|$)/.test(call.url)), false);
 });
 
+test("a WAV-only LIMIT ignores MP3-only infills and continues to a downloadable song", async () => {
+  const directory = new MemoryDirectory();
+  let libraryPage = 0;
+  const runtime = createRuntime({
+    directory,
+    script: SCRIPT
+      .replace('const FORMAT = "mp3"', 'const FORMAT = "wav"')
+      .replace("const LIMIT = 0", "const LIMIT = 1")
+      .replace("const INCLUDE_WORKSPACE = true", "const INCLUDE_WORKSPACE = false"),
+    fetch: async (url) => {
+      url = String(url);
+      runtime.calls.push({ url });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 10 });
+      if (url.endsWith("/api/feed/v3")) {
+        libraryPage++;
+        if (libraryPage === 1) return jsonResponse({ clips: [{
+          id: "wavlimitinfill", title: "Section edit", status: "complete",
+          metadata: { task: "infill", history: [{ type: "concat_infilling", id: "parent-wav-limit" }] },
+        }], next_cursor: "after-infill" });
+        if (libraryPage === 2) return jsonResponse({ clips: [{
+          id: "wavlimitsong", title: "WAV limited song", status: "complete", metadata: {},
+        }], next_cursor: "unread-page" });
+        throw new Error("WAV LIMIT requested an unnecessary page");
+      }
+      if (url.endsWith("/api/gen/wavlimitsong/wav_file/"))
+        return jsonResponse({ wav_file_url: "https://cdn.example/wavlimitsong.wav" });
+      if (url === "https://cdn.example/wavlimitsong.wav")
+        return new Response(new Blob([WAV_BYTES]), { status: 200, headers: { "content-type": "audio/wav" } });
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "WAV-only limited run did not finish", 3000);
+  assert.equal(libraryPage, 2);
+  assert.ok(directory.paths().some((name) => name.endsWith("WAV limited song.wav")));
+  assert.equal(runtime.calls.some((call) => /wavlimitinfill.*(?:wav_file|convert_wav)/.test(call.url)), false);
+});
+
+test("a stems-only LIMIT ignores parent songs and continues until an existing stem", async () => {
+  const directory = new MemoryDirectory();
+  let libraryPage = 0;
+  const runtime = createRuntime({
+    directory,
+    script: SCRIPT
+      .replace("const LIMIT = 0", "const LIMIT = 1")
+      .replace("const INCLUDE_WORKSPACE = true", "const INCLUDE_WORKSPACE = false")
+      .replace("const INCLUDE_STEMS = false", "const INCLUDE_STEMS = true"),
+    fetch: async (url) => {
+      url = String(url);
+      runtime.calls.push({ url });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 10 });
+      if (url.endsWith("/api/feed/v3")) {
+        libraryPage++;
+        if (libraryPage === 1) return jsonResponse({ clips: [{
+          id: "stemlimitparent", title: "Stem parent", status: "complete", metadata: {},
+        }], next_cursor: "after-parent" });
+        if (libraryPage === 2) return jsonResponse({ clips: [{
+          id: "stemlimitvocals", title: "Vocals", status: "complete",
+          metadata: { stem_from_id: "stemlimitparent", stem_task: true, stem_type_group_name: "Vocals" },
+        }], next_cursor: "unread-page" });
+        throw new Error("stems-only LIMIT requested an unnecessary page");
+      }
+      if (url.startsWith("https://cdn1.suno.ai/stemlimitvocals.mp3"))
+        return new Response(new Blob([MP3_BYTES]), { status: 200, headers: { "content-type": "audio/mpeg" } });
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-mp3").checked = false;
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "stems-only limited run did not finish", 3000);
+  assert.equal(libraryPage, 2);
+  assert.ok(directory.paths().some((name) => name.endsWith("/stems/Vocals.mp3")));
+  assert.equal(runtime.calls.some((call) => /stemlimitparent\.mp3/.test(call.url)), false);
+});
+
+test("a complete empty cache reports no songs without paid confirmation", async () => {
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([]));
+  const runtime = createRuntime({
+    directory,
+    script: SCRIPT.replace('const FORMAT = "mp3"', 'const FORMAT = "wav"'),
+  });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => runtime.status() === "No songs found.", "empty cache did not report no songs");
+  assert.equal(runtime.confirms.length, 0);
+  assert.equal(runtime.calls.some((call) => /wav_file|convert_wav/.test(call.url)), false);
+});
+
+test("a paid-format run refreshes the displayed credit balance afterward", async () => {
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "creditrefresh1", title: "Credit refresh" },
+  ]));
+  let billingReads = 0;
+  const runtime = createRuntime({
+    directory,
+    script: SCRIPT.replace('const FORMAT = "mp3"', 'const FORMAT = "wav"'),
+    fetch: async (url) => {
+      url = String(url);
+      runtime.calls.push({ url });
+      if (url.endsWith("/api/billing/credits"))
+        return jsonResponse({ total_credits_left: ++billingReads === 1 ? 55 : 54 });
+      if (url.endsWith("/api/gen/creditrefresh1/wav_file/"))
+        return jsonResponse({ wav_file_url: "https://cdn.example/creditrefresh.wav" });
+      if (url === "https://cdn.example/creditrefresh.wav")
+        return new Response(new Blob([WAV_BYTES]), { status: 200, headers: { "content-type": "audio/wav" } });
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  await waitFor(() => /Credits left: 55/.test(runtime.element("suno-dl-credits").textContent),
+    "initial credit balance was not displayed");
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => !runtime.element("suno-dl-btn").disabled && /^Done\./.test(runtime.status()),
+    "credit-refresh run did not finish", 3000);
+  assert.equal(billingReads, 2);
+  assert.match(runtime.element("suno-dl-credits").textContent, /Credits left: 54/);
+});
+
 (async () => {
   let failed = 0;
   for (const { name, fn } of tests) {

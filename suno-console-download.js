@@ -170,6 +170,14 @@ void (async () => {
     wav: wavCheck.checked,
     midi: midiCheck.checked,
   });
+  const isDownloadable = (entry) => {
+    const fmt = operationOptions?.formats || getFormats();
+    if (entry.isStem) return includeStems();
+    // Section-edit variations only have an existing MP3 to download. Do not let
+    // one satisfy a WAV/MIDI-only LIMIT when download() would produce no file.
+    if (entry.isInfill) return fmt.mp3;
+    return fmt.mp3 || fmt.wav || fmt.midi;
+  };
   const instance = {
     async destroy() {
       destroyed = true;
@@ -419,7 +427,7 @@ void (async () => {
   let scanLimitBaselineIds = new Set();
   let peerScanFailed = false;
   const eligibleScanCount = () => [...scanState.songs.values()].filter((entry) =>
-    !scanLimitBaselineIds.has(entry.id) && (includeStems() || !entry.isStem)).length;
+    !scanLimitBaselineIds.has(entry.id) && isDownloadable(entry)).length;
   const scanLimitReached = () => LIMIT > 0 && eligibleScanCount() >= LIMIT;
   const scanRequestShouldStop = () => scanLimitReached() || peerScanFailed;
 
@@ -1527,8 +1535,7 @@ void (async () => {
     scanState.songs = new Map(entries.map(({ entry }) => [entry.id, entry]));
     assignStableOutputBases();
     await persistCache(dir);
-    let out = [...scanState.songs.values()];
-    if (!includeStems()) out = out.filter((s) => !s.isStem);
+    let out = [...scanState.songs.values()].filter(isDownloadable);
     if (LIMIT > 0) out.splice(LIMIT);
     return { songs: out };
   }
@@ -1559,8 +1566,7 @@ void (async () => {
       : (cached.songs || []).some((s) => s.isStem));
     const needStemRescan = cached && includeStems() && !cacheIncludedStems;
     const needFeedRescan = cached && !cacheMatchesFeedSelection(cached);
-    const cachedEligibleCount = cached
-      ? cached.songs.filter((entry) => includeStems() || !entry.isStem).length : 0;
+    const cachedEligibleCount = cached ? cached.songs.filter(isDownloadable).length : 0;
     const cacheSatisfiesLimit = LIMIT > 0 && cachedEligibleCount >= LIMIT;
     if (cached && !rescan && !needStemRescan && !needFeedRescan &&
         ((cached.libDone && cached.wsDone) || cacheSatisfiesLimit)) {
@@ -1570,9 +1576,9 @@ void (async () => {
         setStatus("Stopped before downloading.");
         return false;
       }
-      songs = [...scanState.songs.values()];
-      if (!includeStems()) songs = songs.filter((s) => !s.isStem);
+      songs = [...scanState.songs.values()].filter(isDownloadable);
       if (LIMIT > 0) songs = songs.slice(0, LIMIT);
+      if (!songs.length) { setStatus("No songs found."); return false; }
       songsDir = dir;
       songsIncludedStems = wantsStems;
       setStatus(`Using cache: ${songs.length} download items.\nStarting download...`);
@@ -1734,10 +1740,12 @@ void (async () => {
       setStatus("Error: " + (err && err.message ? err.message : err));
       startBtn.textContent = "Start";
     } finally {
+      const refreshBalanceAfterRun = !!operationOptions?.creditApproved;
       operationController?.abort();
       operationController = null;
       stopRequested = false;
       operationOptions = null;
+      if (refreshBalanceAfterRun && !destroyed) await refreshCredits();
       setBusy(false);
     }
   })()));
