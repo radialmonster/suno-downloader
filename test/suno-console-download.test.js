@@ -584,6 +584,65 @@ for (const format of ["wav", "midi"]) {
   });
 }
 
+test("an existing WAV downloads without requesting conversion", async () => {
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "wavexisting01", title: "Existing WAV" },
+  ]));
+  let convertPosts = 0;
+  const runtime = createRuntime({
+    directory,
+    fetch: async (url, init = {}) => {
+      url = String(url);
+      runtime.calls.push({ url, init });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 100 });
+      if (url.includes("/api/gen/wavexisting01/wav_file/"))
+        return jsonResponse({ wav_file_url: "https://cdn.example/existing.wav" });
+      if (url.includes("/api/gen/wavexisting01/convert_wav/")) {
+        convertPosts++;
+        return jsonResponse({});
+      }
+      if (url === "https://cdn.example/existing.wav")
+        return new Response(new Blob([WAV_BYTES]), { status: 200, headers: { "content-type": "audio/wav" } });
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-mp3").checked = false;
+  runtime.element("suno-dl-wav").checked = true;
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "existing WAV download did not finish", 3000);
+  assert.equal(convertPosts, 0, "an existing WAV must not request conversion");
+  assert.match(runtime.status(), /1 downloaded, 0 skipped, 0 failed/);
+  assert.ok(directory.paths().some((name) => name.endsWith("Existing WAV.wav")));
+});
+
+test("an ambiguous MIDI request is not automatically reissued", async () => {
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "midiambig001", title: "Ambiguous MIDI" },
+  ]));
+  let midiRequests = 0;
+  const runtime = createRuntime({
+    directory,
+    fetch: async (url, init = {}) => {
+      url = String(url);
+      runtime.calls.push({ url, init });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 100 });
+      if (url.includes("/api/gen/midiambig001/midi/")) {
+        midiRequests++;
+        throw new TypeError("connection lost after MIDI request");
+      }
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-mp3").checked = false;
+  runtime.element("suno-dl-midi").checked = true;
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "ambiguous MIDI request did not settle", 3000);
+  assert.equal(midiRequests, 1, "an ambiguous MIDI request must not be reissued");
+  assert.match(runtime.status(), /0 downloaded, 0 skipped, 1 failed/);
+});
+
 test("an ambiguous WAV conversion request is polled without a second paid POST", async () => {
   const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
     { id: "wavambiguous1", title: "Ambiguous WAV" },
@@ -1298,6 +1357,43 @@ test("reaching LIMIT in one feed prevents retries in the other feed", async () =
   assert.match(runtime.status(), /1 downloaded, 0 skipped, 0 failed/);
 });
 
+test("a concurrent LIMIT selects the same feed priority regardless of response order", async () => {
+  for (const delayedFeed of ["library", "workspace"]) {
+    const directory = new MemoryDirectory();
+    const runtime = createRuntime({
+      directory,
+      script: SCRIPT.replace("const LIMIT = 0", "const LIMIT = 1"),
+      fetch: async (url) => {
+        url = String(url);
+        runtime.calls.push({ url });
+        if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 1 });
+        if (url.endsWith("/api/feed/v3")) {
+          if (delayedFeed === "library") await tick();
+          return jsonResponse({ clips: [{
+            id: "liblimit0001", title: "Library deterministic", status: "complete", metadata: {},
+          }], next_cursor: "library-more" });
+        }
+        if (url.includes("/api/project/feed")) {
+          if (delayedFeed === "workspace") await tick();
+          return jsonResponse({ items: [{ type: "clip", clip: {
+            id: "wslimit00001", title: "Workspace nondeterministic", status: "complete", metadata: {},
+          } }], next_cursor: "workspace-more" });
+        }
+        if (url.startsWith("https://cdn1.suno.ai/"))
+          return new Response(new Blob([MP3_BYTES]), { status: 200, headers: { "content-type": "audio/mpeg" } });
+        throw new Error("Unexpected fetch: " + url);
+      },
+    });
+    runtime.run();
+    runtime.element("suno-dl-btn").click();
+    await waitFor(() => /^Done\./.test(runtime.status()), "deterministic LIMIT run did not finish", 3000);
+    assert.ok(directory.paths().some((name) => name.includes("Library deterministic")), directory.paths().join("\n"));
+    assert.equal(directory.paths().some((name) => name.includes("Workspace nondeterministic")), false);
+    assert.equal(runtime.calls.filter((call) => call.url.endsWith("/api/feed/v3")).length, 1);
+    assert.equal(runtime.calls.filter((call) => call.url.includes("/api/project/feed")).length, 1);
+  }
+});
+
 test("a limited manual re-scan prioritizes newly discovered items", async () => {
   const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
     { id: "oldlimit0001", title: "Older cached song" },
@@ -1970,6 +2066,38 @@ test("case-insensitive ID suffix collisions cannot merge song folders", async ()
   assert.equal(new Set(media.map((name) => name.toLowerCase())).size, 2);
 });
 
+test("a later song ID-prefix collision does not rename the existing folder", async () => {
+  const oldSong = { id: "ABCDEF001111", title: "Same title" };
+  const newSong = { id: "abcdef002222", title: "Same title" };
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([oldSong], {
+    includeLibrary: true,
+    includeWorkspace: false,
+  }));
+  const runtime = createRuntime({
+    directory,
+    script: SCRIPT.replace("const INCLUDE_WORKSPACE = true", "const INCLUDE_WORKSPACE = false"),
+    libraryClips: [
+      { ...newSong, status: "complete", metadata: {} },
+      { ...oldSong, status: "complete", metadata: {} },
+    ],
+  });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "initial stable-folder run did not finish", 3000);
+  const originalPath = directory.paths().find((name) => name.endsWith("Same title.mp3"));
+  assert.ok(originalPath?.startsWith("Same title [ABCDEF00]/"), originalPath);
+  const rescan = runtime.document.walk().find((element) => element.textContent === "Re-scan for new songs");
+  rescan.click();
+  await waitFor(() => /Re-scan complete/.test(runtime.status()), "song collision re-scan did not finish", 3000);
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "post-collision song run did not finish", 3000);
+  const media = directory.paths().filter((name) => name.endsWith("Same title.mp3"));
+  assert.equal(media.length, 2, media.join("\n"));
+  assert.ok(media.includes(originalPath), "the original song folder was renamed");
+  const cache = JSON.parse(await (await directory.getFileHandle("suno-cache.json")).getFile().then((file) => file.text()));
+  assert.equal(cache.songs.find((song) => song.id === oldSong.id).folderOutputBase, "Same title [ABCDEF00]");
+});
+
 test("a later duplicate stem does not rename or redownload the original stem", async () => {
   const parent = { id: "parent000001", title: "Parent" };
   const oldStem = {
@@ -2258,6 +2386,39 @@ test("an unsolicited partial MP3 response is rejected", async () => {
   assert.equal(directory.paths().some((name) => name.endsWith(".mp3")), false);
 });
 
+test("a 200 response with an unsolicited Content-Range is rejected", async () => {
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "range200mp31", title: "Mislabelled partial MP3" },
+  ]));
+  let mediaAttempts = 0;
+  const runtime = createRuntime({
+    directory,
+    fetch: async (url) => {
+      url = String(url);
+      runtime.calls.push({ url });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 1 });
+      if (url.startsWith("https://cdn1.suno.ai/")) {
+        mediaAttempts++;
+        return new Response(new Blob([MP3_BYTES]), {
+          status: 200,
+          headers: {
+            "content-type": "audio/mpeg",
+            "content-length": String(MP3_BYTES.length),
+            "content-range": `bytes 0-${MP3_BYTES.length - 1}/${MP3_BYTES.length * 2}`,
+          },
+        });
+      }
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "mislabelled partial MP3 test did not finish");
+  assert.equal(mediaAttempts, 1, "a deterministic Content-Range response was retried");
+  assert.match(runtime.status(), /partial response/i);
+  assert.equal(directory.paths().some((name) => name.endsWith(".mp3")), false);
+});
+
 for (const [name, clips, workspaceItems] of [
   ["empty library", [{ id: "", title: "Bad", status: "complete", metadata: {} }], []],
   ["whitespace library", [{ id: "   ", title: "Bad", status: "complete", metadata: {} }], []],
@@ -2361,6 +2522,9 @@ for (const [field, value, message] of [
   ["stemName", [], /invalid stem name/i],
   ["sourceFeed", "other", /invalid source feed/i],
   ["audioUrl", "http://cdn.example/song.mp3", /unsafe song audio URL/i],
+  ["stemOutputBase", 7, /invalid persisted stem filename/i],
+  ["variationOutputBase", {}, /invalid persisted variation filename/i],
+  ["folderOutputBase", [], /invalid persisted song folder name/i],
 ]) {
   test("a cache with invalid per-song " + field + " is rejected unchanged", async () => {
     const original = completeCache([{ id: "badfield0001", title: "Bad", [field]: value }]);

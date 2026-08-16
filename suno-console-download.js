@@ -56,7 +56,7 @@ void (async () => {
   const FORMAT = "mp3"; // default checkbox preset: 'mp3', 'wav', or 'both' (MIDI is selected in the panel)
   const LIMIT = 0; // 0 = scan/download all items; N = stop scanning after enough eligible items, then download the first N
   const INCLUDE_LIBRARY = true; // your Suno library (created + liked songs)
-  const INCLUDE_WORKSPACE = true; // your workspace (drafts/in-progress)
+  const INCLUDE_WORKSPACE = true; // completed clips returned by your workspace feed
   const INCLUDE_STEMS = false; // default checkbox preset for already-generated stems (no credits needed)
   const PAUSE_MS = 1500; // delay between songs (be polite to the API)
   const MAX_SCAN_PAGES = 10000; // final backstop for a broken endlessly-paginated API
@@ -433,6 +433,8 @@ void (async () => {
     if (previous && sourcePriority(previous.sourceFeed) > sourcePriority(sourceFeed)) return;
     if (entry.isStem && previous?.stemOutputBase) entry.stemOutputBase = previous.stemOutputBase;
     if (entry.isInfill && previous?.variationOutputBase) entry.variationOutputBase = previous.variationOutputBase;
+    if (!entry.isStem && !entry.isInfill && previous?.folderOutputBase)
+      entry.folderOutputBase = previous.folderOutputBase;
     scanState.songs.set(clip.id, entry);
   };
 
@@ -508,12 +510,15 @@ void (async () => {
       const clips = r.j.clips;
       if (limitReachedByPeer) {
         // This page was already in flight when the other feed met LIMIT. Do
-        // not consume its cursor or add new entries, but reconcile duplicate
-        // IDs so fixed feed priority still wins independently of timing.
+        // not consume its cursor, but retain its validated entries. A fixed
+        // feed ordering below then makes the limited selection independent of
+        // which concurrent response arrived first. A later resume harmlessly
+        // re-reads this page because its cursor was intentionally not consumed.
         for (const c of clips) {
           if (!c || typeof c !== "object" || !validClipId(c.id))
             throw new Error("library feed error: invalid clip entry");
-          if (scanState.songs.has(c.id) && c.status === "complete" && (includeStems() || !isStem(c)))
+          scanState.seenIds.add(c.id);
+          if (c.status === "complete" && (includeStems() || !isStem(c)))
             upsertScanEntry(c, "library");
         }
         await persist(dir);
@@ -579,7 +584,8 @@ void (async () => {
           if (it.type !== "clip" || !c) continue;
           if (typeof c !== "object" || !validClipId(c.id))
             throw new Error("project feed error: invalid clip entry");
-          if (scanState.songs.has(c.id) && c.status === "complete" && (includeStems() || !isStem(c)))
+          scanState.seenIds.add(c.id);
+          if (c.status === "complete" && (includeStems() || !isStem(c)))
             upsertScanEntry(c, "workspace");
         }
         await persist(dir);
@@ -813,12 +819,18 @@ void (async () => {
         }
         const blob = await Promise.race([res.blob(), requestAborted]);
         const expected = Number(res.headers.get("content-length"));
+        const contentRange = (res.headers.get("content-range") || "").trim();
         const contentEncoding = (res.headers.get("content-encoding") || "").trim().toLowerCase();
         const contentType = (res.headers.get("content-type") || "").toLowerCase();
         // Fetch exposes decoded response bytes, while Content-Length can describe
         // the encoded transfer. Compare sizes only when no content coding changed
         // the representation delivered to Blob.
         const comparableLength = !contentEncoding || contentEncoding === "identity";
+        // No Range header was sent. A Content-Range response is therefore an
+        // unsolicited partial representation even when a broken intermediary
+        // labels it 200 and its Content-Length matches the truncated body.
+        if (contentRange)
+          throw Object.assign(new Error("partial response while fetching " + url), { retryable: false });
         if (!blob.size || (comparableLength && Number.isFinite(expected) && expected > 0 && blob.size !== expected))
           throw new Error("incomplete response while fetching " + url);
         if (/^(text\/|application\/(?:json|xml))/.test(contentType)) {
@@ -939,7 +951,10 @@ void (async () => {
     if (!operationOptions?.creditApproved) throw new Error("MIDI conversion was not approved");
     const encodedId = encodeURIComponent(String(id));
     for (let n = 0; n < 60; n++) {
-      const r = await api("GET", `/api/gen/${encodedId}/midi/`);
+      // This GET can initiate a conversion. A timeout or 5xx is ambiguous, so
+      // allow only the explicit 401 token-refresh retry and never automatically
+      // reissue a request whose server-side effect is unknown.
+      const r = await api("GET", `/api/gen/${encodedId}/midi/`, null, 1, { retryAmbiguous: false });
       if (r.status !== 200) throw new Error("midi " + r.status + ": " + (r.j?.raw || r.j?.detail || "unexpected response"));
       if (r.j?.state === "complete") {
         if (!Array.isArray(r.j.instruments)) throw new Error("midi response missing instruments");
@@ -1075,6 +1090,7 @@ void (async () => {
   // Preserve the established "<title> [<id8>]" layout unless two clips really
   // share that output path, in which case the full IDs prevent an overwrite.
   const folderFor = (entry) => {
+    if (entry.folderOutputBase) return sanitize(entry.folderOutputBase);
     const base = sanitize(entry.title);
     const key = collisionKey(entry.title);
     const peers = [...scanState.songs.values()].filter((candidate) =>
@@ -1140,13 +1156,43 @@ void (async () => {
 
   function assignStableOutputBases() {
     const entries = [...scanState.songs.values()];
+    const songsChanged = assignStableSongFolders(
+      entries.filter((entry) => !entry.isStem && !entry.isInfill));
     const stemsChanged = assignStableBases(
       entries.filter((entry) => entry.isStem),
       "stemOutputBase", (entry) => entry.stemName || entry.title, "stem");
     const variationsChanged = assignStableBases(
       entries.filter((entry) => entry.isInfill),
       "variationOutputBase", (entry) => entry.title, "variation");
-    return stemsChanged || variationsChanged;
+    return songsChanged || stemsChanged || variationsChanged;
+  }
+
+  function assignStableSongFolders(entries) {
+    const used = new Map();
+    for (const entry of entries) {
+      if (!entry.folderOutputBase) continue;
+      entry.folderOutputBase = sanitize(entry.folderOutputBase);
+      const key = collisionKey(entry.folderOutputBase);
+      if (used.has(key) && used.get(key) !== entry.id)
+        throw new Error("cache contains colliding persisted song folder names");
+      used.set(key, entry.id);
+    }
+    let changed = false;
+    for (const entry of [...entries].sort((a, b) => a.id.localeCompare(b.id))) {
+      if (entry.folderOutputBase) continue;
+      const titlePeers = entries.filter((candidate) =>
+        collisionKey(candidate.title) === collisionKey(entry.title));
+      const base = sanitize(entry.title);
+      let candidate = withSuffix(base, " [" + collisionSafeId(entry, titlePeers) + "]");
+      if (used.has(collisionKey(candidate)))
+        candidate = withSuffix(base, " [" + idFingerprint(entry.id) + "]");
+      if (used.has(collisionKey(candidate)))
+        throw new Error("could not assign a collision-free song folder name");
+      entry.folderOutputBase = candidate;
+      used.set(collisionKey(candidate), entry.id);
+      changed = true;
+    }
+    return changed;
   }
 
   const variationFileBase = (entry) => {
@@ -1371,6 +1417,9 @@ void (async () => {
       if ((cached.songs || []).some((song) => song.variationOutputBase !== undefined &&
           typeof song.variationOutputBase !== "string"))
         throw new Error("cache contains an invalid persisted variation filename");
+      if ((cached.songs || []).some((song) => song.folderOutputBase !== undefined &&
+          typeof song.folderOutputBase !== "string"))
+        throw new Error("cache contains an invalid persisted song folder name");
       if ((cached.seenIds || []).some((id) => !validClipId(id)))
         throw new Error("cache contains an invalid seen ID");
       return cached;
@@ -1463,17 +1512,19 @@ void (async () => {
     peerScanFailed = false;
     const failedScan = scans.find((result) => result.status === "rejected");
     if (failedScan) throw failedScan.reason;
-    if (scanLimitBaselineIds.size) {
-      // A manual re-scan discovers newest items after seeding older cached ones.
-      // Put those discoveries first so LIMIT selects what the re-scan just found,
-      // and persist that same deterministic priority for the next run.
-      const entries = [...scanState.songs.values()];
-      const prioritized = [
-        ...entries.filter((entry) => !scanLimitBaselineIds.has(entry.id)),
-        ...entries.filter((entry) => scanLimitBaselineIds.has(entry.id)),
-      ];
-      scanState.songs = new Map(prioritized.map((entry) => [entry.id, entry]));
-    }
+    // Concurrent feeds have no shared response order. Use fixed library-before-
+    // workspace groups while preserving each feed's newest-first insertion order.
+    // On a manual re-scan, newly discovered entries remain ahead of cached ones.
+    const entries = [...scanState.songs.values()].map((entry, index) => ({ entry, index }));
+    entries.sort((a, b) => {
+      if (scanLimitBaselineIds.size) {
+        const aOld = scanLimitBaselineIds.has(a.entry.id);
+        const bOld = scanLimitBaselineIds.has(b.entry.id);
+        if (aOld !== bOld) return aOld ? 1 : -1;
+      }
+      return sourcePriority(b.entry.sourceFeed) - sourcePriority(a.entry.sourceFeed) || a.index - b.index;
+    });
+    scanState.songs = new Map(entries.map(({ entry }) => [entry.id, entry]));
     assignStableOutputBases();
     await persistCache(dir);
     let out = [...scanState.songs.values()];
