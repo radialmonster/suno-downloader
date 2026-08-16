@@ -1394,6 +1394,43 @@ test("a concurrent LIMIT selects the same feed priority regardless of response o
   }
 });
 
+test("duplicate promotion preserves deterministic library order under LIMIT", async () => {
+  for (const delayedFeed of ["library", "workspace"]) {
+    const directory = new MemoryDirectory();
+    const runtime = createRuntime({
+      directory,
+      script: SCRIPT.replace("const LIMIT = 0", "const LIMIT = 1"),
+      fetch: async (url) => {
+        url = String(url);
+        runtime.calls.push({ url });
+        if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 1 });
+        if (url.endsWith("/api/feed/v3")) {
+          if (delayedFeed === "library") await tick();
+          return jsonResponse({ clips: [
+            { id: "librarypeer1", title: "Library first peer", status: "complete", metadata: {} },
+            { id: "sharedorder1", title: "Shared library clip", status: "complete", metadata: {} },
+          ], next_cursor: "library-more" });
+        }
+        if (url.includes("/api/project/feed")) {
+          if (delayedFeed === "workspace") await tick();
+          return jsonResponse({ items: [{ type: "clip", clip: {
+            id: "sharedorder1", title: "Shared workspace clip", status: "complete", metadata: {},
+          } }], next_cursor: "workspace-more" });
+        }
+        if (url.startsWith("https://cdn1.suno.ai/"))
+          return new Response(new Blob([MP3_BYTES]), { status: 200, headers: { "content-type": "audio/mpeg" } });
+        throw new Error("Unexpected fetch: " + url);
+      },
+    });
+    runtime.run();
+    runtime.element("suno-dl-btn").click();
+    await waitFor(() => /^Done\./.test(runtime.status()), "duplicate promotion LIMIT run did not finish", 3000);
+    assert.ok(directory.paths().some((name) => name.includes("Library first peer")), directory.paths().join("\n"));
+    assert.equal(directory.paths().some((name) => name.includes("Shared library clip")), false);
+    assert.equal(directory.paths().some((name) => name.includes("Shared workspace clip")), false);
+  }
+});
+
 test("a limited manual re-scan prioritizes newly discovered items", async () => {
   const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
     { id: "oldlimit0001", title: "Older cached song" },
@@ -1436,6 +1473,137 @@ test("a limited manual re-scan prioritizes newly discovered items", async () => 
   const media = directory.paths().filter((name) => name.endsWith(".mp3"));
   assert.equal(media.length, 1);
   assert.ok(media[0].endsWith("Newest discovered song.mp3"));
+});
+
+test("a stopped limited manual re-scan resumes with its persisted new-item baseline", async () => {
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "oldresume001", title: "Old cached one" },
+    { id: "oldresume002", title: "Old cached two" },
+  ], {
+    includeLibrary: true,
+    includeWorkspace: false,
+  }));
+  let libraryCalls = 0;
+  let resuming = false;
+  const runtime = createRuntime({
+    directory,
+    script: SCRIPT
+      .replace("const LIMIT = 0", "const LIMIT = 2")
+      .replace("const INCLUDE_WORKSPACE = true", "const INCLUDE_WORKSPACE = false"),
+    fetch: async (url, init = {}) => {
+      url = String(url);
+      runtime.calls.push({ url, init });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 1 });
+      if (url.endsWith("/api/feed/v3")) {
+        libraryCalls++;
+        if (libraryCalls === 1) return jsonResponse({ clips: [{
+          id: "newresume001", title: "Newly found one", status: "complete", metadata: {},
+        }], next_cursor: "resume-here" });
+        if (!resuming) return new Promise((resolve, reject) => {
+          const error = new Error("stopped pending page");
+          error.name = "AbortError";
+          init.signal.addEventListener("abort", () => reject(error), { once: true });
+        });
+        return jsonResponse({ clips: [{
+          id: "newresume002", title: "Newly found two", status: "complete", metadata: {},
+        }], next_cursor: null });
+      }
+      if (url.startsWith("https://cdn1.suno.ai/"))
+        return new Response(new Blob([MP3_BYTES]), { status: 200, headers: { "content-type": "audio/mpeg" } });
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.document.walk().find((element) => element.textContent === "Re-scan for new songs").click();
+  await waitFor(() => libraryCalls === 2, "manual re-scan did not reach its pending second page");
+  resuming = true;
+  runtime.document.walk().find((element) => element.textContent === "Stop").click();
+  await waitFor(() => /Re-scan stopped/.test(runtime.status()), "manual re-scan did not stop", 3000);
+  let cache = JSON.parse(await (await directory.getFileHandle("suno-cache.json")).getFile().then((file) => file.text()));
+  assert.deepEqual(cache.rescanBaselineIds.sort(), ["oldresume001", "oldresume002"]);
+  assert.equal(cache.libCursor, "resume-here");
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "limited re-scan resume did not finish", 3000);
+  assert.equal(libraryCalls, 3, "the saved re-scan cursor was not resumed");
+  const media = directory.paths().filter((name) => name.endsWith(".mp3"));
+  assert.equal(media.length, 2, media.join("\n"));
+  assert.ok(media.some((name) => name.endsWith("Newly found one.mp3")));
+  assert.ok(media.some((name) => name.endsWith("Newly found two.mp3")));
+  assert.equal(media.some((name) => name.includes("Old cached")), false);
+  cache = JSON.parse(await (await directory.getFileHandle("suno-cache.json")).getFile().then((file) => file.text()));
+  assert.deepEqual(cache.rescanBaselineIds.sort(), ["oldresume001", "oldresume002"]);
+});
+
+test("a completed limited re-scan keeps new workspace items ahead after a fresh paste", async () => {
+  const oldSongs = [
+    { id: "oldcross001", title: "Old library one", sourceFeed: "library" },
+    { id: "oldcross002", title: "Old library two", sourceFeed: "library" },
+  ];
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache(oldSongs, {
+    includeLibrary: true,
+    includeWorkspace: true,
+  }));
+  const rescanRuntime = createRuntime({
+    directory,
+    script: SCRIPT.replace("const LIMIT = 0", "const LIMIT = 2"),
+    fetch: async (url) => {
+      url = String(url);
+      rescanRuntime.calls.push({ url });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 1 });
+      if (url.endsWith("/api/feed/v3")) return jsonResponse({ clips: oldSongs.map((song) => ({
+        ...song, status: "complete", metadata: {},
+      })), next_cursor: null });
+      if (url.includes("/api/project/feed")) return jsonResponse({ items: [{ type: "clip", clip: {
+        id: "newcross001", title: "New workspace song", status: "complete", metadata: {},
+      } }], next_cursor: null });
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  rescanRuntime.run();
+  rescanRuntime.document.walk().find((element) => element.textContent === "Re-scan for new songs").click();
+  await waitFor(() => /Re-scan complete/.test(rescanRuntime.status()), "completed cross-feed re-scan did not finish", 3000);
+  let cache = JSON.parse(await (await directory.getFileHandle("suno-cache.json")).getFile().then((file) => file.text()));
+  assert.deepEqual(cache.songs.map((song) => song.id), ["newcross001", "oldcross001", "oldcross002"]);
+  assert.deepEqual(cache.rescanBaselineIds.sort(), ["oldcross001", "oldcross002"]);
+
+  const freshRuntime = createRuntime({
+    directory,
+    script: SCRIPT.replace("const LIMIT = 0", "const LIMIT = 2"),
+    fetch: async (url) => {
+      url = String(url);
+      freshRuntime.calls.push({ url });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 1 });
+      if (url.startsWith("https://cdn1.suno.ai/"))
+        return new Response(new Blob([MP3_BYTES]), { status: 200, headers: { "content-type": "audio/mpeg" } });
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  freshRuntime.run();
+  freshRuntime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(freshRuntime.status()), "fresh cached cross-feed run did not finish", 3000);
+  const media = directory.paths().filter((name) => name.endsWith(".mp3"));
+  assert.equal(media.length, 2, media.join("\n"));
+  assert.equal(media.some((name) => name.includes("New workspace song")), true);
+  assert.equal(media.filter((name) => name.includes("Old library")).length, 1);
+});
+
+test("cache reordering still runs stable output-name migration", async () => {
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "oldmigrate01", title: "Old migration", sourceFeed: "library" },
+    { id: "newmigrate01", title: "New migration", sourceFeed: "workspace" },
+  ], {
+    rescanBaselineIds: ["oldmigrate01"],
+  }));
+  const runtime = createRuntime({
+    directory,
+    script: SCRIPT.replace("const LIMIT = 0", "const LIMIT = 1"),
+  });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "cache reorder migration did not finish", 3000);
+  const cache = JSON.parse(await (await directory.getFileHandle("suno-cache.json")).getFile().then((file) => file.text()));
+  assert.deepEqual(cache.songs.map((song) => song.id), ["newmigrate01", "oldmigrate01"]);
+  assert.equal(cache.songs.every((song) => typeof song.folderOutputBase === "string"), true);
 });
 
 test("a contradictory has_more signal fails closed", async () => {
@@ -2066,6 +2234,27 @@ test("case-insensitive ID suffix collisions cannot merge song folders", async ()
   assert.equal(new Set(media.map((name) => name.toLowerCase())).size, 2);
 });
 
+test("song folders cannot collide with synthesized missing-parent folders", async () => {
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "parent01-song", title: "Missing parent" },
+    { id: "orphanstem01", title: "Vocals", isStem: true, parentId: "parent01", stemName: "Vocals" },
+  ], { stemsIncluded: true }));
+  const runtime = createRuntime({
+    directory,
+    script: SCRIPT.replace("const INCLUDE_STEMS = false", "const INCLUDE_STEMS = true"),
+  });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "top-level collision run did not finish", 3000);
+  assert.equal(directory.directories.size, 2, directory.paths().join("\n"));
+  const media = directory.paths().filter((name) => name.endsWith(".mp3"));
+  assert.equal(media.length, 2, media.join("\n"));
+  assert.equal(media.some((name) => name === "Missing parent [parent01]/Missing parent.mp3"), true);
+  assert.equal(media.some((name) => name.includes("/stems/Vocals.mp3")), true);
+  assert.notEqual(media.find((name) => name.includes("/stems/Vocals.mp3")).split("/")[0],
+    "Missing parent [parent01]");
+});
+
 test("a later song ID-prefix collision does not rename the existing folder", async () => {
   const oldSong = { id: "ABCDEF001111", title: "Same title" };
   const newSong = { id: "abcdef002222", title: "Same title" };
@@ -2466,6 +2655,7 @@ for (const [field, value] of [
   ["libCursor", []],
   ["wsCursor", 42],
   ["scanned", "12"],
+  ["rescanBaselineIds", {}],
 ]) {
   test("a cache with an invalid " + field + " type is rejected unchanged", async () => {
     const original = completeCache([], { [field]: value, libDone: false, wsDone: false });
@@ -2476,6 +2666,25 @@ for (const [field, value] of [
     await waitFor(() => /cache/i.test(runtime.status()) && new RegExp(field, "i").test(runtime.status()),
       "invalid " + field + " was not reported");
     assert.equal(runtime.calls.some((call) => /\/api\/(feed\/v3|project\/feed)/.test(call.url)), false);
+    assert.equal(await (await directory.getFileHandle("suno-cache.json")).getFile().then((file) => file.text()), original);
+  });
+}
+
+for (const [name, baseline, message] of [
+  ["an invalid", ["   "], /invalid re-scan baseline ID/i],
+  ["a duplicate", ["cachedbase01", "cachedbase01"], /duplicate re-scan baseline IDs/i],
+  ["an unknown", ["missingbase01"], /unknown song ID/i],
+]) {
+  test("a cache with " + name + " re-scan baseline is rejected unchanged", async () => {
+    const original = completeCache([{ id: "cachedbase01", title: "Cached baseline" }], {
+      rescanBaselineIds: baseline,
+    });
+    const directory = new MemoryDirectory().seed("suno-cache.json", original);
+    const runtime = createRuntime({ directory });
+    runtime.run();
+    runtime.element("suno-dl-btn").click();
+    await waitFor(() => message.test(runtime.status()), "invalid re-scan baseline was not reported");
+    assert.equal(runtime.calls.some((call) => /cdn|\/api\/(feed\/v3|project\/feed)/i.test(call.url)), false);
     assert.equal(await (await directory.getFileHandle("suno-cache.json")).getFile().then((file) => file.text()), original);
   });
 }

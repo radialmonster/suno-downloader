@@ -445,6 +445,13 @@ void (async () => {
       entry.orphanFolderOutputBase = previous.orphanFolderOutputBase;
     if (!entry.isStem && !entry.isInfill && previous?.folderOutputBase)
       entry.folderOutputBase = previous.folderOutputBase;
+    // Map#set preserves an existing key's old insertion position. When a clip
+    // first arrives from workspace and is later promoted to library metadata,
+    // move it to the library response's current position so a positive LIMIT
+    // cannot select different items merely because the feeds resolved in the
+    // opposite order.
+    if (previous && sourcePriority(previous.sourceFeed) < sourcePriority(sourceFeed))
+      scanState.songs.delete(clip.id);
     scanState.songs.set(clip.id, entry);
   };
 
@@ -1170,19 +1177,20 @@ void (async () => {
 
   function assignStableOutputBases() {
     const entries = [...scanState.songs.values()];
+    const topLevelUsed = prepareTopLevelReservations(entries);
     const songsChanged = assignStableSongFolders(
-      entries.filter((entry) => !entry.isStem && !entry.isInfill));
+      entries.filter((entry) => !entry.isStem && !entry.isInfill), topLevelUsed);
     const stemsChanged = assignStableBases(
       entries.filter((entry) => entry.isStem),
       "stemOutputBase", (entry) => entry.stemName || entry.title, "stem");
     const variationsChanged = assignStableBases(
       entries.filter((entry) => entry.isInfill),
       "variationOutputBase", (entry) => entry.title, "variation");
-    const orphanFoldersChanged = assignStableOrphanFolders(entries);
+    const orphanFoldersChanged = assignStableOrphanFolders(entries, topLevelUsed);
     return songsChanged || stemsChanged || variationsChanged || orphanFoldersChanged;
   }
 
-  function assignStableOrphanFolders(entries) {
+  function orphanGroups(entries) {
     const groups = new Map();
     for (const entry of entries) {
       if ((!entry.isStem && !entry.isInfill) || scanState.songs.has(entry.parentId)) continue;
@@ -1190,8 +1198,24 @@ void (async () => {
       if (!groups.has(parentId)) groups.set(parentId, []);
       groups.get(parentId).push(entry);
     }
+    return groups;
+  }
+
+  function prepareTopLevelReservations(entries) {
     const used = new Map();
-    for (const [parentId, peers] of groups) {
+    const reserve = (name, owner) => {
+      const clean = sanitize(name);
+      const key = collisionKey(clean);
+      if (used.has(key) && used.get(key) !== owner)
+        throw new Error("cache contains colliding persisted top-level folder names");
+      used.set(key, owner);
+      return clean;
+    };
+    for (const entry of entries) {
+      if (!entry.isStem && !entry.isInfill && entry.folderOutputBase)
+        entry.folderOutputBase = reserve(entry.folderOutputBase, "song:" + entry.id);
+    }
+    for (const [parentId, peers] of orphanGroups(entries)) {
       const persisted = [...new Set(peers
         .map((entry) => entry.orphanFolderOutputBase)
         .filter((value) => value !== undefined)
@@ -1199,11 +1223,17 @@ void (async () => {
       if (persisted.length > 1)
         throw new Error("cache contains inconsistent persisted orphan folder names");
       if (!persisted.length) continue;
-      const key = collisionKey(persisted[0]);
-      if (used.has(key) && used.get(key) !== parentId)
-        throw new Error("cache contains colliding persisted orphan folder names");
-      used.set(key, parentId);
-      for (const entry of peers) entry.orphanFolderOutputBase = persisted[0];
+      const clean = reserve(persisted[0], "orphan:" + parentId);
+      for (const entry of peers) entry.orphanFolderOutputBase = clean;
+    }
+    return used;
+  }
+
+  function assignStableOrphanFolders(entries, used) {
+    const groups = orphanGroups(entries);
+    for (const [parentId, peers] of groups) {
+      if (!peers[0].orphanFolderOutputBase) continue;
+      used.set(collisionKey(peers[0].orphanFolderOutputBase), "orphan:" + parentId);
     }
     let changed = false;
     for (const [parentId, peers] of [...groups].sort(([a], [b]) => a.localeCompare(b))) {
@@ -1215,23 +1245,14 @@ void (async () => {
           "-" + idFingerprint(parentId) + "]");
       if (used.has(collisionKey(candidate)))
         throw new Error("could not assign a collision-free orphan folder name");
-      used.set(collisionKey(candidate), parentId);
+      used.set(collisionKey(candidate), "orphan:" + parentId);
       for (const entry of peers) entry.orphanFolderOutputBase = candidate;
       changed = true;
     }
     return changed;
   }
 
-  function assignStableSongFolders(entries) {
-    const used = new Map();
-    for (const entry of entries) {
-      if (!entry.folderOutputBase) continue;
-      entry.folderOutputBase = sanitize(entry.folderOutputBase);
-      const key = collisionKey(entry.folderOutputBase);
-      if (used.has(key) && used.get(key) !== entry.id)
-        throw new Error("cache contains colliding persisted song folder names");
-      used.set(key, entry.id);
-    }
+  function assignStableSongFolders(entries, used) {
     let changed = false;
     for (const entry of [...entries].sort((a, b) => a.id.localeCompare(b.id))) {
       if (entry.folderOutputBase) continue;
@@ -1244,7 +1265,7 @@ void (async () => {
       if (used.has(collisionKey(candidate)))
         throw new Error("could not assign a collision-free song folder name");
       entry.folderOutputBase = candidate;
-      used.set(collisionKey(candidate), entry.id);
+      used.set(collisionKey(candidate), "song:" + entry.id);
       changed = true;
     }
     return changed;
@@ -1430,6 +1451,8 @@ void (async () => {
       if (cached.scanned !== undefined &&
           (!Number.isInteger(cached.scanned) || cached.scanned < 0))
         throw new Error("cache scanned field is not a non-negative integer");
+      if (cached.rescanBaselineIds !== undefined && !Array.isArray(cached.rescanBaselineIds))
+        throw new Error("cache rescanBaselineIds field is not an array");
       const hasIncludeLibrary = cached.includeLibrary !== undefined;
       const hasIncludeWorkspace = cached.includeWorkspace !== undefined;
       if (hasIncludeLibrary !== hasIncludeWorkspace)
@@ -1481,6 +1504,13 @@ void (async () => {
         throw new Error("cache contains an invalid persisted orphan folder name");
       if ((cached.seenIds || []).some((id) => !validClipId(id)))
         throw new Error("cache contains an invalid seen ID");
+      if ((cached.rescanBaselineIds || []).some((id) => !validClipId(id)))
+        throw new Error("cache contains an invalid re-scan baseline ID");
+      if (new Set(cached.rescanBaselineIds || []).size !== (cached.rescanBaselineIds || []).length)
+        throw new Error("cache contains duplicate re-scan baseline IDs");
+      const cachedSongIds = new Set(cached.songs.map((song) => song.id));
+      if ((cached.rescanBaselineIds || []).some((id) => !cachedSongIds.has(id)))
+        throw new Error("cache re-scan baseline contains an unknown song ID");
       return cached;
     } catch (err) {
       // Missing caches are normal, including for caches written by older runs.
@@ -1504,6 +1534,7 @@ void (async () => {
       includeWorkspace: INCLUDE_WORKSPACE,
       songs: [...scanState.songs.values()],
       seenIds: [...scanState.seenIds],
+      rescanBaselineIds: [...scanLimitBaselineIds],
       scanned: scanState.scanned,
     }, null, 2);
     // Recover the queue after an earlier rejected write, but let this write's
@@ -1539,6 +1570,7 @@ void (async () => {
       ? cached.stemsIncluded
       : (cached.songs || []).some((s) => s.isStem);
     scanState.scanned = cached.scanned || 0;
+    scanLimitBaselineIds = new Set(cached.rescanBaselineIds || []);
   }
 
   function resetScanState() {
@@ -1550,6 +1582,22 @@ void (async () => {
     scanState.wsDone = !INCLUDE_WORKSPACE;
     scanState.stemsIncluded = false;
     scanState.scanned = 0;
+    scanLimitBaselineIds = new Set();
+  }
+
+  function orderScanEntries() {
+    const before = [...scanState.songs.keys()];
+    const entries = [...scanState.songs.values()].map((entry, index) => ({ entry, index }));
+    entries.sort((a, b) => {
+      if (scanLimitBaselineIds.size) {
+        const aOld = scanLimitBaselineIds.has(a.entry.id);
+        const bOld = scanLimitBaselineIds.has(b.entry.id);
+        if (aOld !== bOld) return aOld ? 1 : -1;
+      }
+      return sourcePriority(b.entry.sourceFeed) - sourcePriority(a.entry.sourceFeed) || a.index - b.index;
+    });
+    scanState.songs = new Map(entries.map(({ entry }) => [entry.id, entry]));
+    return before.some((id, index) => id !== entries[index]?.entry.id);
   }
 
   async function enumerateSongs(dir) {
@@ -1574,16 +1622,7 @@ void (async () => {
     // Concurrent feeds have no shared response order. Use fixed library-before-
     // workspace groups while preserving each feed's newest-first insertion order.
     // On a manual re-scan, newly discovered entries remain ahead of cached ones.
-    const entries = [...scanState.songs.values()].map((entry, index) => ({ entry, index }));
-    entries.sort((a, b) => {
-      if (scanLimitBaselineIds.size) {
-        const aOld = scanLimitBaselineIds.has(a.entry.id);
-        const bOld = scanLimitBaselineIds.has(b.entry.id);
-        if (aOld !== bOld) return aOld ? 1 : -1;
-      }
-      return sourcePriority(b.entry.sourceFeed) - sourcePriority(a.entry.sourceFeed) || a.index - b.index;
-    });
-    scanState.songs = new Map(entries.map(({ entry }) => [entry.id, entry]));
+    orderScanEntries();
     assignStableOutputBases();
     await persistCache(dir);
     let out = [...scanState.songs.values()].filter(isDownloadable);
@@ -1625,12 +1664,18 @@ void (async () => {
       : (cached.songs || []).some((s) => s.isStem));
     const needStemRescan = cached && includeStems() && !cacheIncludedStems;
     const needFeedRescan = cached && !cacheMatchesFeedSelection(cached);
-    const cachedEligibleCount = cached ? cached.songs.filter(isDownloadable).length : 0;
+    const cachedBaselineIds = new Set(cached?.rescanBaselineIds || []);
+    const cachedEligibleCount = cached ? cached.songs.filter((entry) =>
+      !cachedBaselineIds.has(entry.id) && isDownloadable(entry)).length : 0;
     const cacheSatisfiesLimit = LIMIT > 0 && cachedEligibleCount >= LIMIT;
     if (cached && !rescan && !needStemRescan && !needFeedRescan &&
         ((cached.libDone && cached.wsDone) || cacheSatisfiesLimit)) {
       restoreScanState(cached);
-      if (assignStableOutputBases()) await persistCache(dir);
+      const orderChanged = orderScanEntries();
+      // Assignment also validates persisted collision metadata. Never skip it
+      // merely because the ordering itself already requires a cache write.
+      const basesChanged = assignStableOutputBases();
+      if (orderChanged || basesChanged) await persistCache(dir);
       if (operationCancelled()) {
         setStatus("Stopped before downloading.");
         return false;
@@ -1646,7 +1691,6 @@ void (async () => {
     }
     earlyStopLibrary = false; // normal/partial-cache scans resume from their saved cursors
     earlyStopWorkspace = false;
-    scanLimitBaselineIds = new Set();
     if (cached && !needFeedRescan) restoreScanState(cached);
     else resetScanState();
     if (needStemRescan && !needFeedRescan) {
@@ -1658,6 +1702,7 @@ void (async () => {
       scanState.libDone = !INCLUDE_LIBRARY;
       scanState.wsDone = !INCLUDE_WORKSPACE;
       scanState.stemsIncluded = true;
+      scanLimitBaselineIds = new Set();
     }
     const { songs: fresh } = await enumerateSongs(dir);
     if (stopRequested) { setStatus("Scan stopped. Progress saved - rerun to resume."); return false; }
