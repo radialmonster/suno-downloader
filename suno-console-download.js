@@ -25,12 +25,12 @@
  * Set INCLUDE_STEMS = true to also download already-generated stems - these are
  * just re-downloaded, so they cost no credits (only generating stems does).
  *
- * Resumable: rerun any time and it skips songs already present in the folder.
+ * Resumable: rerun any time and it skips requested files already present in the folder.
  * The chosen folder gets a suno-cache.json so reruns skip the slow re-enumeration;
  * use the "Re-scan for new songs" link when you've added songs since the last run.
  *
- * Requirements: Chrome or Edge (Chromium). Safari/Firefox lack the folder
- * picker API, so on those browsers it falls back to normal per-file downloads.
+ * Chrome or Edge is required for folder/cache/resume features. Safari/Firefox
+ * lack the folder picker API, so they fall back to normal per-file downloads.
  */
 void (async () => {
   const INSTANCE_KEY = "__sunoBulkDownloaderInstance";
@@ -141,7 +141,7 @@ void (async () => {
       <input type="checkbox" id="suno-dl-wav"> WAV (may require conversion)
     </label>
     <label style="display:flex;align-items:center;gap:8px;margin-bottom:6px;cursor:pointer">
-      <input type="checkbox" id="suno-dl-midi"> MIDI (uses credits)
+      <input type="checkbox" id="suno-dl-midi"> MIDI (may use credits)
     </label>
     <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer">
       <input type="checkbox" id="suno-dl-stems"> Include stems (already-generated ones, free)
@@ -441,6 +441,8 @@ void (async () => {
     if (previous && sourcePriority(previous.sourceFeed) > sourcePriority(sourceFeed)) return;
     if (entry.isStem && previous?.stemOutputBase) entry.stemOutputBase = previous.stemOutputBase;
     if (entry.isInfill && previous?.variationOutputBase) entry.variationOutputBase = previous.variationOutputBase;
+    if ((entry.isStem || entry.isInfill) && previous?.orphanFolderOutputBase)
+      entry.orphanFolderOutputBase = previous.orphanFolderOutputBase;
     if (!entry.isStem && !entry.isInfill && previous?.folderOutputBase)
       entry.folderOutputBase = previous.folderOutputBase;
     scanState.songs.set(clip.id, entry);
@@ -457,7 +459,7 @@ void (async () => {
 
   const progress = (kind, page) =>
     setStatus(kind + " page " + page +
-      " | scanned " + scanState.scanned + " clips, found " + scanState.songs.size + " songs" +
+      " | scanned " + scanState.scanned + " clips, retained " + scanState.songs.size + " items" +
       (scanState.songs.size ? "" : " (mostly stems - will skip them)"));
 
   const cursorKey = (cursor) => {
@@ -886,7 +888,10 @@ void (async () => {
       if (preferred === fallback || destroyed || stopRequested ||
           operationController?.signal.aborted || instanceController.signal.aborted)
         throw preferredError;
-      try { return await fetchBlob(fallback, "mp3"); } catch { throw preferredError; }
+      try { return await fetchBlob(fallback, "mp3"); } catch (fallbackError) {
+        throw new Error("feed-provided MP3 URL failed: " + (preferredError?.message || preferredError) +
+          "; legacy CDN fallback failed: " + (fallbackError?.message || fallbackError));
+      }
     }
   }
 
@@ -921,12 +926,13 @@ void (async () => {
     if (wav.state === "ready") return wav.url;
     if (wav.state === "error") throw new Error("wav_file " + r.status);
     const alreadyPending = wav.state === "pending";
-    // A lost response is ambiguous: Suno may have accepted this paid conversion.
+    // A lost response is ambiguous: Suno may have accepted this potentially
+    // credit-consuming conversion.
     // Never automatically resubmit it. One retry remains available only for the
     // explicit 401 path, which is known not to have run the conversion.
     if (!alreadyPending)
       r = await api("POST", `/api/gen/${encodedId}/convert_wav/`, null, 1, { retryAmbiguous: false });
-    // A network failure or 5xx may happen after the paid request reached Suno.
+    // A network failure or 5xx may happen after the conversion request reached Suno.
     // Poll the read-only result endpoint in that ambiguous case, but never risk
     // a second conversion POST. Explicit 4xx responses are safe to surface.
     const ambiguous = !alreadyPending && (r.status === 0 || (r.status >= 500 && r.status <= 599));
@@ -1172,7 +1178,48 @@ void (async () => {
     const variationsChanged = assignStableBases(
       entries.filter((entry) => entry.isInfill),
       "variationOutputBase", (entry) => entry.title, "variation");
-    return songsChanged || stemsChanged || variationsChanged;
+    const orphanFoldersChanged = assignStableOrphanFolders(entries);
+    return songsChanged || stemsChanged || variationsChanged || orphanFoldersChanged;
+  }
+
+  function assignStableOrphanFolders(entries) {
+    const groups = new Map();
+    for (const entry of entries) {
+      if ((!entry.isStem && !entry.isInfill) || scanState.songs.has(entry.parentId)) continue;
+      const parentId = String(entry.parentId || entry.id);
+      if (!groups.has(parentId)) groups.set(parentId, []);
+      groups.get(parentId).push(entry);
+    }
+    const used = new Map();
+    for (const [parentId, peers] of groups) {
+      const persisted = [...new Set(peers
+        .map((entry) => entry.orphanFolderOutputBase)
+        .filter((value) => value !== undefined)
+        .map(sanitize))];
+      if (persisted.length > 1)
+        throw new Error("cache contains inconsistent persisted orphan folder names");
+      if (!persisted.length) continue;
+      const key = collisionKey(persisted[0]);
+      if (used.has(key) && used.get(key) !== parentId)
+        throw new Error("cache contains colliding persisted orphan folder names");
+      used.set(key, parentId);
+      for (const entry of peers) entry.orphanFolderOutputBase = persisted[0];
+    }
+    let changed = false;
+    for (const [parentId, peers] of [...groups].sort(([a], [b]) => a.localeCompare(b))) {
+      if (peers[0].orphanFolderOutputBase) continue;
+      const base = withSuffix("Missing parent", " [" + sanitize(parentId) + "]");
+      let candidate = base;
+      if (used.has(collisionKey(candidate)))
+        candidate = withSuffix("Missing parent", " [" + truncatePortable(sanitize(parentId), 80) +
+          "-" + idFingerprint(parentId) + "]");
+      if (used.has(collisionKey(candidate)))
+        throw new Error("could not assign a collision-free orphan folder name");
+      used.set(collisionKey(candidate), parentId);
+      for (const entry of peers) entry.orphanFolderOutputBase = candidate;
+      changed = true;
+    }
+    return changed;
   }
 
   function assignStableSongFolders(entries) {
@@ -1217,6 +1264,7 @@ void (async () => {
   };
 
   const orphanParentFolder = (entry) => {
+    if (entry.orphanFolderOutputBase) return sanitize(entry.orphanFolderOutputBase);
     // A parent may be absent from the selected feeds. Key the fallback directory
     // by that parent rather than by the child title: otherwise Vocals and Drums
     // belonging to one missing parent are incorrectly split into two song folders.
@@ -1231,7 +1279,7 @@ void (async () => {
     return withSuffix("Missing parent", " [" + token + "]");
   };
 
-  // download() returns { files: "mp3+wav:fail+midi:skip", fails: 1 }
+  // download() returns { files: ["mp3", "wav:fail", "midi:skip"], fails: 1, errors: [...] }
   async function download(entry, dir) {
     const { id, title, isStem, parentId } = entry;
     const clean = sanitize(title);
@@ -1428,6 +1476,9 @@ void (async () => {
       if ((cached.songs || []).some((song) => song.folderOutputBase !== undefined &&
           typeof song.folderOutputBase !== "string"))
         throw new Error("cache contains an invalid persisted song folder name");
+      if ((cached.songs || []).some((song) => song.orphanFolderOutputBase !== undefined &&
+          typeof song.orphanFolderOutputBase !== "string"))
+        throw new Error("cache contains an invalid persisted orphan folder name");
       if ((cached.seenIds || []).some((id) => !validClipId(id)))
         throw new Error("cache contains an invalid seen ID");
       return cached;
@@ -1552,10 +1603,18 @@ void (async () => {
   let pickedDir = null;
   let songsDir = null;
   let songsIncludedStems = null;
+  let songsEligibilityKey = null;
+
+  const eligibilityKey = () => JSON.stringify({
+    formats: operationOptions?.formats || getFormats(),
+    includeStems: includeStems(),
+  });
 
   async function ensureSongs(dir) {
     const wantsStems = includeStems();
-    if (songs.length && !rescan && songsDir === dir && songsIncludedStems === wantsStems) return true;
+    const wantedEligibility = eligibilityKey();
+    if (songs.length && !rescan && songsDir === dir && songsIncludedStems === wantsStems &&
+        songsEligibilityKey === wantedEligibility) return true;
     const cached = await readCache(dir);
     if (operationCancelled()) {
       setStatus("Stopped before scanning.");
@@ -1581,6 +1640,7 @@ void (async () => {
       if (!songs.length) { setStatus("No songs found."); return false; }
       songsDir = dir;
       songsIncludedStems = wantsStems;
+      songsEligibilityKey = wantedEligibility;
       setStatus(`Using cache: ${songs.length} download items.\nStarting download...`);
       return true;
     }
@@ -1604,6 +1664,7 @@ void (async () => {
     songs = fresh;
     songsDir = dir;
     songsIncludedStems = wantsStems;
+    songsEligibilityKey = wantedEligibility;
     if (!songs.length) { setStatus("No songs found."); return false; }
     setStatus(`Found ${songs.length} download items${includeStems() ? " (songs and stems)" : ""}.\nStarting download...`);
     return true;
@@ -1648,6 +1709,7 @@ void (async () => {
         songs = [];
         songsDir = null;
         songsIncludedStems = null;
+        songsEligibilityKey = null;
       }
       pickedDir = dir;
       setStatus("Folder selected. Press Start to download.");
@@ -1745,7 +1807,13 @@ void (async () => {
       operationController = null;
       stopRequested = false;
       operationOptions = null;
-      if (refreshBalanceAfterRun && !destroyed) await refreshCredits();
+      if (refreshBalanceAfterRun && !destroyed) {
+        // The download is over, so Stop must not remain actionable while this
+        // informational request uses only the lifetime-wide instance signal.
+        setBusy(true, false);
+        await refreshCredits();
+      }
+      stopRequested = false;
       setBusy(false);
     }
   })()));
@@ -1768,6 +1836,7 @@ void (async () => {
       songs = [];
       songsDir = null;
       songsIncludedStems = null;
+      songsEligibilityKey = null;
       stopRequested = false;
       setStatus("Re-scanning...");
       try {
@@ -1812,6 +1881,7 @@ void (async () => {
         songs = fresh;
         songsDir = dir;
         songsIncludedStems = includeStems();
+        songsEligibilityKey = eligibilityKey();
         rescan = false;
         earlyStopLibrary = false;
         earlyStopWorkspace = false;

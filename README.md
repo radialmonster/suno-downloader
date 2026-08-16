@@ -30,7 +30,7 @@ Download your completed Suno clips as MP3, WAV, and MIDI with one paste into the
 6. Press **Enter** to run it.
 
 7. A small panel appears. Tick the formats you want:
-   - **MP3** — fast, works for every song
+   - **MP3** — fast and available for completed clips with valid audio
    - **WAV** — downloads an existing WAV directly; if none exists, Suno may need to convert it first
    - **MIDI** — Suno converts each song to note data (typically the slowest format). **May use account credits.**
    - **Include stems** — also downloads your existing stems (only if you have them). Stems must have been generated in Suno first (click "Get stems" on a song in Suno, which costs credits) — this tool only *downloads* stems that already exist, it never generates them.
@@ -72,7 +72,7 @@ Download your completed Suno clips as MP3, WAV, and MIDI with one paste into the
 
 ## First scan takes a few minutes
 
-Suno's feeds can return your songs mixed in with generated stems. The first scan walks through the returned clips to find your real songs. The progress panel shows how many clips it has scanned, so don't worry if it sits at "found 0 songs" for a while — it may be processing stems, which are skipped automatically unless you enabled them.
+Suno's feeds can return your songs mixed in with generated stems. The first scan walks through the returned clips to find your real songs. The progress panel shows how many clips it has scanned, so don't worry if it sits at "retained 0 items" for a while — it may be processing stems, which are skipped automatically unless you enabled them.
 
 After a complete scan, `suno-cache.json` makes unchanged reruns instant. A partial scan, changed feed/stem settings, or an explicit re-scan can require more feed requests.
 
@@ -81,7 +81,7 @@ If you set the source-level `LIMIT` option above zero, the downloader stops requ
 ## Notes on usage
 
 - Songs downloaded with this tool may not be eligible for your commercial use. It is **your responsibility** to follow Suno's Terms of Service and any applicable license terms for the music you download.
-- This project is not affiliated with, endorsed by, or connected to Suno. It is an independent, personal-use tool that talks to the same API endpoints used by the Suno web app, from your own logged-in browser session.
+- This project is not affiliated with, endorsed by, or connected to Suno. It is an independent, personal-use tool that talks directly to Suno's API from your own logged-in browser session.
 - No credentials are sent to this project or unrelated third parties. Authenticated API requests send your session token only to Suno; media downloads use HTTPS audio URLs returned by Suno's feeds (normally Suno's CDN) and do not include your authorization header.
 
 ## Requirements

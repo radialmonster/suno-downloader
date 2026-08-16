@@ -2525,6 +2525,7 @@ for (const [field, value, message] of [
   ["stemOutputBase", 7, /invalid persisted stem filename/i],
   ["variationOutputBase", {}, /invalid persisted variation filename/i],
   ["folderOutputBase", [], /invalid persisted song folder name/i],
+  ["orphanFolderOutputBase", 7, /invalid persisted orphan folder name/i],
 ]) {
   test("a cache with invalid per-song " + field + " is rejected unchanged", async () => {
     const original = completeCache([{ id: "badfield0001", title: "Bad", [field]: value }]);
@@ -2685,6 +2686,7 @@ test("removing a positive limit resumes a partial cache", async () => {
 for (const [label, contentType, bytes] of [
   ["HTML", "text/html", "<html>not audio</html>"],
   ["JSON", "application/json", '{"error":"not audio"}'],
+  ["image", "image/png", new Uint8Array([0x89, 0x50, 0x4e, 0x47])],
 ]) {
   test(label + " media returned with HTTP 200 is rejected", async () => {
     const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
@@ -2955,6 +2957,157 @@ test("a paid-format run refreshes the displayed credit balance afterward", async
     "credit-refresh run did not finish", 3000);
   assert.equal(billingReads, 2);
   assert.match(runtime.element("suno-dl-credits").textContent, /Credits left: 54/);
+});
+
+test("changing formats between Starts rebuilds the eligible item selection", async () => {
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "formatparent1", title: "Format parent" },
+    { id: "formatinfill1", title: "[00:10 - 00:20] verse", isInfill: true, parentId: "formatparent1" },
+  ]));
+  const runtime = createRuntime({
+    directory,
+    script: SCRIPT.replace('const FORMAT = "mp3"', 'const FORMAT = "wav"'),
+    fetch: async (url) => {
+      url = String(url);
+      runtime.calls.push({ url });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 55 });
+      if (url.endsWith("/api/gen/formatparent1/wav_file/"))
+        return jsonResponse({ wav_file_url: "https://cdn.example/format-parent.wav" });
+      if (url === "https://cdn.example/format-parent.wav")
+        return new Response(new Blob([WAV_BYTES]), { status: 200, headers: { "content-type": "audio/wav" } });
+      if (url.startsWith("https://cdn1.suno.ai/"))
+        return new Response(new Blob([MP3_BYTES]), { status: 200, headers: { "content-type": "audio/mpeg" } });
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => !runtime.element("suno-dl-btn").disabled && /^Done\./.test(runtime.status()),
+    "initial WAV run did not finish", 3000);
+  runtime.element("suno-dl-wav").checked = false;
+  runtime.element("suno-dl-mp3").checked = true;
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => !runtime.element("suno-dl-btn").disabled && /^Done\./.test(runtime.status()),
+    "second MP3 run did not finish", 3000);
+  assert.ok(directory.paths().some((name) => name.includes("/variations/") && name.endsWith(".mp3")),
+    directory.paths().join("\n"));
+});
+
+test("Stop is disabled during the post-run credit refresh and cannot poison the next Start", async () => {
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "creditstop01", title: "Credit stop" },
+  ]));
+  let billingReads = 0;
+  let resolveRefresh;
+  const refreshResponse = new Promise((resolve) => { resolveRefresh = resolve; });
+  const runtime = createRuntime({
+    directory,
+    script: SCRIPT.replace('const FORMAT = "mp3"', 'const FORMAT = "wav"'),
+    fetch: async (url) => {
+      url = String(url);
+      runtime.calls.push({ url });
+      if (url.endsWith("/api/billing/credits")) {
+        billingReads++;
+        if (billingReads === 2) return refreshResponse;
+        return jsonResponse({ total_credits_left: 55 });
+      }
+      if (url.endsWith("/api/gen/creditstop01/wav_file/"))
+        return jsonResponse({ wav_file_url: "https://cdn.example/credit-stop.wav" });
+      if (url === "https://cdn.example/credit-stop.wav")
+        return new Response(new Blob([WAV_BYTES]), { status: 200, headers: { "content-type": "audio/wav" } });
+      if (url.startsWith("https://cdn1.suno.ai/"))
+        return new Response(new Blob([MP3_BYTES]), { status: 200, headers: { "content-type": "audio/mpeg" } });
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  await waitFor(() => billingReads === 1, "initial billing read did not finish");
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => billingReads === 2 && /^Done\./.test(runtime.status()), "post-run refresh did not start", 3000);
+  const stop = runtime.document.walk().find((element) => element.textContent === "Stop");
+  assert.equal(stop.disabled, true, "Stop remained actionable after the download operation ended");
+  stop.click();
+  resolveRefresh(jsonResponse({ total_credits_left: 55 }));
+  await waitFor(() => !runtime.element("suno-dl-btn").disabled, "post-run refresh did not settle");
+  runtime.element("suno-dl-wav").checked = false;
+  runtime.element("suno-dl-mp3").checked = true;
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => !runtime.element("suno-dl-btn").disabled && /^Done\./.test(runtime.status()),
+    "the next Start was poisoned by a late Stop", 3000);
+  assert.ok(directory.paths().some((name) => name.endsWith("Credit stop.mp3")));
+});
+
+test("MP3 failure reports both the feed URL and legacy CDN fallback causes", async () => {
+  const preferredUrl = "https://media.example/expired.mp3";
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "doublefail01", title: "Double failure", audioUrl: preferredUrl },
+  ]));
+  const runtime = createRuntime({
+    directory,
+    fetch: async (url) => {
+      url = String(url);
+      runtime.calls.push({ url });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 1 });
+      if (url === preferredUrl) return new Response("missing", { status: 404 });
+      if (url === "https://cdn1.suno.ai/doublefail01.mp3") return new Response("gone", { status: 410 });
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "double MP3 failure did not settle", 3000);
+  assert.match(runtime.status(), /feed-provided MP3 URL failed/i);
+  assert.match(runtime.status(), /HTTP 404.*expired\.mp3/i);
+  assert.match(runtime.status(), /legacy CDN fallback failed/i);
+  assert.match(runtime.status(), /HTTP 410.*doublefail01\.mp3/i);
+});
+
+test("a later orphan-parent collision does not move the existing orphan folder", async () => {
+  const oldStem = { id: "oldorphan01", title: "Vocals", isStem: true, parentId: "PARENT", stemName: "Vocals" };
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([oldStem], {
+    stemsIncluded: true,
+    includeLibrary: true,
+    includeWorkspace: false,
+  }));
+  let rescanning = false;
+  const runtime = createRuntime({
+    directory,
+    script: SCRIPT
+      .replace("const INCLUDE_STEMS = false", "const INCLUDE_STEMS = true")
+      .replace("const INCLUDE_WORKSPACE = true", "const INCLUDE_WORKSPACE = false"),
+    fetch: async (url) => {
+      url = String(url);
+      runtime.calls.push({ url });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 1 });
+      if (url.endsWith("/api/feed/v3")) return jsonResponse({ clips: rescanning ? [
+        { id: "neworphan01", title: "Drums", status: "complete",
+          metadata: { stem_from_id: "parent", stem_task: true, stem_type_group_name: "Drums" } },
+        { id: "oldorphan01", title: "Vocals", status: "complete",
+          metadata: { stem_from_id: "PARENT", stem_task: true, stem_type_group_name: "Vocals" } },
+      ] : [], next_cursor: null });
+      if (url.startsWith("https://cdn1.suno.ai/"))
+        return new Response(new Blob([MP3_BYTES]), { status: 200, headers: { "content-type": "audio/mpeg" } });
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "initial orphan run did not finish", 3000);
+  const originalPath = directory.paths().find((name) => name.endsWith("/stems/Vocals.mp3"));
+  assert.ok(originalPath);
+  rescanning = true;
+  runtime.document.walk().find((element) => element.textContent === "Re-scan for new songs").click();
+  await waitFor(() => /Re-scan complete/.test(runtime.status()), "orphan re-scan did not finish", 3000);
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "second orphan run did not finish", 3000);
+  const stemPaths = directory.paths().filter((name) => name.includes("/stems/") && name.endsWith(".mp3"));
+  assert.equal(stemPaths.length, 2, stemPaths.join("\n"));
+  assert.ok(stemPaths.includes(originalPath), "the original orphan folder moved after a later collision");
+  assert.equal(stemPaths.filter((name) => name.endsWith("/stems/Vocals.mp3")).length, 1);
+  const cache = JSON.parse(await (await directory.getFileHandle("suno-cache.json")).getFile().then((file) => file.text()));
+  assert.equal(cache.songs.find((song) => song.id === oldStem.id).orphanFolderOutputBase, "Missing parent [PARENT]");
+  assert.notEqual(cache.songs.find((song) => song.id === "neworphan01").orphanFolderOutputBase,
+    "Missing parent [parent]");
 });
 
 (async () => {
