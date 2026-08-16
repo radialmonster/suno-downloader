@@ -1093,7 +1093,7 @@ test("feed requests use current parameters and paginate from next_cursor without
   assert.equal(secondQuery.get("cursor"), "workspace cursor");
 });
 
-test("a contradictory legacy has_more signal fails closed", async () => {
+test("a contradictory has_more signal fails closed", async () => {
   const directory = new MemoryDirectory();
   const runtime = createRuntime({
     directory,
@@ -1812,6 +1812,233 @@ test("background credit retries do not overwrite operation status", async () => 
     "credit retry did not settle");
   assert.equal(runtime.status(), "", "background credit retry clobbered the main status");
 });
+
+test("Include stems can run without selecting a full-song format", async () => {
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "stemonly0001", title: "Vocals", isStem: true, parentId: "missingparent", stemName: "Vocals" },
+  ], { stemsIncluded: true }));
+  const runtime = createRuntime({ directory });
+  runtime.run();
+  runtime.element("suno-dl-mp3").checked = false;
+  runtime.element("suno-dl-wav").checked = false;
+  runtime.element("suno-dl-midi").checked = false;
+  runtime.element("suno-dl-stems").checked = true;
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "stems-only operation did not finish", 3000);
+  assert.ok(directory.paths().some((name) => name.endsWith("/stems/Vocals.mp3")));
+  assert.equal(runtime.confirms.length, 0, "free existing stems prompted for paid conversion approval");
+  assert.equal(runtime.calls.some((call) => /\/api\/gen\//.test(call.url)), false,
+    "stems-only operation invoked a conversion endpoint");
+});
+
+test("a permanently hung API response body times out and restores the UI", async () => {
+  let feedAttempts = 0;
+  const runtime = createRuntime({
+    fireLongTimers: true,
+    fetch: async (url) => {
+      url = String(url);
+      runtime.calls.push({ url });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 1 });
+      if (url.endsWith("/api/feed/v3")) {
+        feedAttempts++;
+        return {
+          status: 200,
+          text: async () => new Promise(() => {}),
+        };
+      }
+      if (url.includes("/api/project/feed")) return jsonResponse({ items: [], next_cursor: null });
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => !runtime.element("suno-dl-btn").disabled,
+    "hung API response body did not time out and restore the UI", 5000);
+  assert.equal(feedAttempts, 6, "hung API body retries were not bounded");
+  assert.match(runtime.status(), /^Error: library feed error 0: response timed out after retries/);
+});
+
+test("a permanently hung media response body times out and restores the UI", async () => {
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "hungmedia001", title: "Hung media" },
+  ]));
+  let mediaAttempts = 0;
+  const runtime = createRuntime({
+    directory,
+    fireLongTimers: true,
+    fetch: async (url) => {
+      url = String(url);
+      runtime.calls.push({ url });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 1 });
+      if (url.startsWith("https://cdn1.suno.ai/")) {
+        mediaAttempts++;
+        return {
+          ok: true,
+          status: 200,
+          headers: new Headers({ "content-type": "audio/mpeg" }),
+          blob: async () => new Promise(() => {}),
+        };
+      }
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()),
+    "hung media response body did not time out and restore the UI", 5000);
+  assert.equal(mediaAttempts, 3, "hung media body retries were not bounded");
+  assert.match(runtime.status(), /0 downloaded, 0 skipped, 1 failed/);
+  assert.equal(directory.paths().some((name) => name.endsWith(".mp3")), false);
+});
+
+test("Stop before a folder write commits aborts the pending media file", async () => {
+  let releaseWrite;
+  let writeStarted = false;
+  let closeCalls = 0;
+  let abortCalls = 0;
+  const writeGate = new Promise((resolve) => { releaseWrite = resolve; });
+  class HoldingDirectory extends MemoryDirectory {
+    async getDirectoryHandle(name, options = {}) {
+      let directory = this.directories.get(name);
+      if (!directory && options.create) {
+        directory = new HoldingDirectory(name);
+        this.directories.set(name, directory);
+      }
+      if (!directory) return super.getDirectoryHandle(name, options);
+      return directory;
+    }
+
+    async getFileHandle(name, options = {}) {
+      if (!name.endsWith(".mp3")) return super.getFileHandle(name, options);
+      let file = this.files.get(name);
+      if (!file && options.create) {
+        file = new MemoryFile();
+        this.files.set(name, file);
+      }
+      if (!file) return super.getFileHandle(name, options);
+      file.createWritable = async () => {
+        let pending = file.blob;
+        return {
+          write: async (content) => {
+            pending = content instanceof Blob ? content : new Blob([content]);
+            writeStarted = true;
+            await writeGate;
+          },
+          close: async () => { closeCalls++; file.blob = pending; },
+          abort: async () => { abortCalls++; },
+        };
+      };
+      return file;
+    }
+  }
+  const directory = new HoldingDirectory().seed("suno-cache.json", completeCache([
+    { id: "stopwrite001", title: "Stop write" },
+  ]));
+  const runtime = createRuntime({ directory });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => writeStarted, "folder media write did not start");
+  runtime.document.walk().find((element) => element.textContent === "Stop").click();
+  releaseWrite();
+  await waitFor(() => /^Stopped\./.test(runtime.status()), "stopped folder write did not settle");
+  assert.equal(closeCalls, 0, "stopped media write was committed");
+  assert.equal(abortCalls, 1, "stopped media write was not aborted");
+  const mediaPath = directory.paths().find((name) => name.endsWith(".mp3"));
+  assert.ok(mediaPath, "mock file handle was not created before cancellation");
+  const songDir = directory.directories.values().next().value;
+  const mediaFile = [...songDir.files.values()].find((file) => file instanceof MemoryFile);
+  assert.equal(mediaFile.blob.size, 0, "stopped media bytes were committed to the folder");
+});
+
+test("an unsolicited partial MP3 response is rejected", async () => {
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "partialmp3001", title: "Partial MP3" },
+  ]));
+  let mediaAttempts = 0;
+  const runtime = createRuntime({
+    directory,
+    fetch: async (url) => {
+      url = String(url);
+      runtime.calls.push({ url });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 1 });
+      if (url.startsWith("https://cdn1.suno.ai/")) {
+        mediaAttempts++;
+        return new Response(new Blob([MP3_BYTES]), {
+          status: 206,
+          headers: { "content-type": "audio/mpeg", "content-range": "bytes 0-833/1668" },
+        });
+      }
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "partial MP3 response test did not finish");
+  assert.equal(mediaAttempts, 1, "deterministic unsolicited partial response was retried");
+  assert.match(runtime.status(), /0 downloaded, 0 skipped, 1 failed/);
+  assert.equal(directory.paths().some((name) => name.endsWith(".mp3")), false);
+});
+
+for (const [name, clips, workspaceItems] of [
+  ["empty library", [{ id: "", title: "Bad", status: "complete", metadata: {} }], []],
+  ["whitespace library", [{ id: "   ", title: "Bad", status: "complete", metadata: {} }], []],
+  ["empty workspace", [], [{ type: "clip", clip: { id: "", title: "Bad", status: "complete", metadata: {} } }]],
+  ["whitespace workspace", [], [{ type: "clip", clip: { id: "\t", title: "Bad", status: "complete", metadata: {} } }]],
+]) {
+  test(name + " clip IDs are rejected before caching or downloading", async () => {
+    const directory = new MemoryDirectory();
+    const runtime = createRuntime({ directory, libraryClips: clips, workspaceItems });
+    runtime.run();
+    runtime.element("suno-dl-btn").click();
+    await waitFor(() => !runtime.element("suno-dl-btn").disabled, name + " ID test did not settle");
+    assert.match(runtime.status(), /invalid clip entry/i);
+    assert.equal(runtime.calls.some((call) => call.url.startsWith("https://cdn1.suno.ai/")), false);
+    const cache = JSON.parse(await (await directory.getFileHandle("suno-cache.json")).getFile().then((file) => file.text()));
+    assert.equal(cache.songs.some((song) => !song.id.trim()), false);
+  });
+}
+
+for (const badId of ["", "   "]) {
+  test("a cache with " + (badId ? "a whitespace-only" : "an empty") + " song ID is rejected unchanged", async () => {
+    const original = completeCache([{ id: badId, title: "Bad cache ID" }]);
+    const directory = new MemoryDirectory().seed("suno-cache.json", original);
+    const runtime = createRuntime({ directory });
+    runtime.run();
+    runtime.element("suno-dl-btn").click();
+    await waitFor(() => /invalid song entry/i.test(runtime.status()), "invalid cached ID was not reported");
+    assert.equal(runtime.calls.some((call) => /cdn|\/api\/(feed\/v3|project\/feed)/i.test(call.url)), false);
+    assert.equal(await (await directory.getFileHandle("suno-cache.json")).getFile().then((file) => file.text()), original);
+  });
+}
+
+test("a cache with a whitespace-only seen ID is rejected unchanged", async () => {
+  const original = completeCache([], { seenIds: ["   "] });
+  const directory = new MemoryDirectory().seed("suno-cache.json", original);
+  const runtime = createRuntime({ directory });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /invalid seen ID/i.test(runtime.status()), "invalid cached seen ID was not reported");
+  assert.equal(runtime.calls.some((call) => /cdn|\/api\/(feed\/v3|project\/feed)/i.test(call.url)), false);
+  assert.equal(await (await directory.getFileHandle("suno-cache.json")).getFile().then((file) => file.text()), original);
+});
+
+for (const [field, value] of [
+  ["libCursor", []],
+  ["wsCursor", 42],
+  ["scanned", "12"],
+]) {
+  test("a cache with an invalid " + field + " type is rejected unchanged", async () => {
+    const original = completeCache([], { [field]: value, libDone: false, wsDone: false });
+    const directory = new MemoryDirectory().seed("suno-cache.json", original);
+    const runtime = createRuntime({ directory });
+    runtime.run();
+    runtime.element("suno-dl-btn").click();
+    await waitFor(() => /cache/i.test(runtime.status()) && new RegExp(field, "i").test(runtime.status()),
+      "invalid " + field + " was not reported");
+    assert.equal(runtime.calls.some((call) => /\/api\/(feed\/v3|project\/feed)/.test(call.url)), false);
+    assert.equal(await (await directory.getFileHandle("suno-cache.json")).getFile().then((file) => file.text()), original);
+  });
+}
 
 (async () => {
   let failed = 0;

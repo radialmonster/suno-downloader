@@ -54,7 +54,7 @@ void (async () => {
   document.getElementById("suno-bulk-downloader-panel")?.remove();
 
   const FORMAT = "mp3"; // default checkbox preset: 'mp3', 'wav', or 'both' (MIDI is selected in the panel)
-  const LIMIT = 0; // 0 = all songs, or N = first N songs
+  const LIMIT = 0; // 0 = all download items, or N = first N song/stem/variation entries
   const INCLUDE_LIBRARY = true; // your Suno library (created + liked songs)
   const INCLUDE_WORKSPACE = true; // your workspace (drafts/in-progress)
   const INCLUDE_STEMS = false; // also download already-generated stems (no credits needed)
@@ -109,6 +109,8 @@ void (async () => {
   let destroyed = false;
   const instanceController = new AbortController();
   let operationController = null;
+  const operationCancelled = () => destroyed || stopRequested ||
+    !!operationController?.signal.aborted || instanceController.signal.aborted;
   // Directory creation and file writes cannot take an AbortSignal. Keep every
   // in-flight filesystem mutation here so a replacement instance waits for the
   // old one to become completely quiescent before it starts using the folder.
@@ -240,12 +242,12 @@ void (async () => {
           if (requestController.signal.aborted) rejectOnAbort();
         });
         const requestHeaders = await Promise.race([headers(refreshToken), authStopped]);
-        res = await fetch(API + p, {
+        res = await Promise.race([fetch(API + p, {
           method,
           headers: requestHeaders,
           body: body ? JSON.stringify(body) : undefined,
           signal: requestController.signal,
-        });
+        }), authStopped]);
       } catch (err) {
         clearTimeout(timeout);
         signal.removeEventListener("abort", abortRequest);
@@ -289,7 +291,19 @@ void (async () => {
       }
       let text;
       try {
-        text = await res.text();
+        // Some response implementations do not reject body reads when their
+        // AbortSignal fires. Race the read explicitly so timeout, Stop, and a
+        // replacement paste always release the operation.
+        const bodyAborted = new Promise((_, reject) => {
+          const rejectOnAbort = () => {
+            const error = new Error("response body aborted");
+            error.name = "AbortError";
+            reject(error);
+          };
+          requestController.signal.addEventListener("abort", rejectOnAbort, { once: true });
+          if (requestController.signal.aborted) rejectOnAbort();
+        });
+        text = await Promise.race([res.text(), bodyAborted]);
       } catch (err) {
         clearTimeout(timeout);
         signal.removeEventListener("abort", abortRequest);
@@ -412,14 +426,16 @@ void (async () => {
   const cursorKey = (cursor) => {
     try { return JSON.stringify(cursor); } catch { return String(cursor); }
   };
+  const validClipId = (value) => typeof value === "string" && value.trim().length > 0;
+  const validCursor = (value) => value === null ||
+    (typeof value === "string" && value.length > 0) ||
+    (value && typeof value === "object" && !Array.isArray(value));
 
   const responseCursor = (body, feedName) => {
     if (!Object.prototype.hasOwnProperty.call(body || {}, "next_cursor"))
       throw new Error(feedName + " feed error: response is missing next_cursor");
     const next = body.next_cursor;
-    const valid = next === null || (typeof next === "string" && next.length > 0) ||
-      (next && typeof next === "object" && !Array.isArray(next));
-    if (!valid) throw new Error(feedName + " feed error: invalid next_cursor");
+    if (!validCursor(next)) throw new Error(feedName + " feed error: invalid next_cursor");
     if (body.has_more !== undefined) {
       if (typeof body.has_more !== "boolean")
         throw new Error(feedName + " feed error: has_more is not a boolean");
@@ -462,7 +478,7 @@ void (async () => {
       scanState.scanned += clips.length;
       let known = 0;
       for (const c of clips) {
-        if (!c || typeof c !== "object" || typeof c.id !== "string")
+        if (!c || typeof c !== "object" || !validClipId(c.id))
           throw new Error("library feed error: invalid clip entry");
         if (earlyStopLibrary && knownBeforeRescan.has(c.id)) known++;
         scanState.seenIds.add(c.id);
@@ -519,7 +535,7 @@ void (async () => {
           throw new Error("project feed error: invalid item entry");
         const c = it.clip;
         if (it.type !== "clip" || !c) continue;
-        if (typeof c !== "object" || typeof c.id !== "string")
+        if (typeof c !== "object" || !validClipId(c.id))
           throw new Error("project feed error: invalid clip entry");
         scannedThisPage++;
         if (earlyStopWorkspace && knownBeforeRescan.has(c.id)) known++;
@@ -554,13 +570,13 @@ void (async () => {
   async function getOrCreateSubDir(parent, name) {
     if (!parent) return null;
     const creation = (async () => {
-      if (destroyed) throw new Error("downloader instance was replaced");
+      if (operationCancelled()) throw new Error("download stopped");
       try {
         const child = await parent.getDirectoryHandle(name, { create: true });
-        if (destroyed) throw new Error("downloader instance was replaced");
+        if (operationCancelled()) throw new Error("download stopped");
         return child;
       } catch (e) {
-        if (destroyed) throw new Error("downloader instance was replaced");
+        if (operationCancelled()) throw new Error("download stopped");
         throw new Error("could not create sub-folder '" + name + "': " + e.message);
       }
     })();
@@ -571,11 +587,13 @@ void (async () => {
     const write = (async () => {
       let w = null;
       try {
-        if (destroyed) throw new Error("downloader instance was replaced");
+        if (operationCancelled()) throw new Error("download stopped");
         const handle = await dir.getFileHandle(name, { create: true });
-        if (destroyed) throw new Error("downloader instance was replaced");
+        if (operationCancelled()) throw new Error("download stopped");
         w = await handle.createWritable();
+        if (operationCancelled()) throw new Error("download stopped");
         await w.write(blob);
+        if (operationCancelled()) throw new Error("download stopped");
         await w.close();
       } catch (err) {
         if (w) try { await w.abort(); } catch {}
@@ -723,13 +741,25 @@ void (async () => {
       let timedOut = false;
       const timeout = setTimeout(() => { timedOut = true; requestController.abort(); }, 60000);
       try {
-        const res = await fetch(url, { signal: requestController.signal });
-        if (!res.ok) {
+        const requestAborted = new Promise((_, reject) => {
+          const rejectOnAbort = () => {
+            const error = new Error("download request aborted");
+            error.name = "AbortError";
+            reject(error);
+          };
+          requestController.signal.addEventListener("abort", rejectOnAbort, { once: true });
+          if (requestController.signal.aborted) rejectOnAbort();
+        });
+        const res = await Promise.race([fetch(url, { signal: requestController.signal }), requestAborted]);
+        // No Range request was sent, so a 206 body is necessarily only part of
+        // the media even when its own Content-Length matches. Require the full
+        // representation status rather than saving a plausible truncated file.
+        if (res.status !== 200) {
           const error = new Error("HTTP " + res.status + " while fetching " + url);
           error.retryable = res.status === 429 || (res.status >= 500 && res.status <= 599);
           throw error;
         }
-        const blob = await res.blob();
+        const blob = await Promise.race([res.blob(), requestAborted]);
         const expected = Number(res.headers.get("content-length"));
         const contentType = (res.headers.get("content-type") || "").toLowerCase();
         if (!blob.size || (Number.isFinite(expected) && expected > 0 && blob.size !== expected))
@@ -797,7 +827,8 @@ void (async () => {
     const conversionState = String(r.j?.state ?? r.j?.status ?? "").toLowerCase();
     if (["pending", "queued", "running", "processing", "in_progress"].includes(conversionState))
       return { state: "pending" };
-    // The current API uses an empty object to mean that no WAV exists yet.
+    // An observed, known-compatible API response uses an empty object to mean
+    // that no WAV exists yet.
     // Do not treat a non-empty, unknown 200 response as absence: it might be a
     // changed error/status shape, and POSTing then could spend credits needlessly.
     if (r.j && typeof r.j === "object" && !Array.isArray(r.j) && Object.keys(r.j).length === 0)
@@ -1231,6 +1262,13 @@ void (async () => {
         throw new Error("cache wsDone field is not a boolean");
       if (cached.stemsIncluded !== undefined && typeof cached.stemsIncluded !== "boolean")
         throw new Error("cache stemsIncluded field is not a boolean");
+      if (cached.libCursor !== undefined && !validCursor(cached.libCursor))
+        throw new Error("cache libCursor field is invalid");
+      if (cached.wsCursor !== undefined && !validCursor(cached.wsCursor))
+        throw new Error("cache wsCursor field is invalid");
+      if (cached.scanned !== undefined &&
+          (!Number.isInteger(cached.scanned) || cached.scanned < 0))
+        throw new Error("cache scanned field is not a non-negative integer");
       const hasIncludeLibrary = cached.includeLibrary !== undefined;
       const hasIncludeWorkspace = cached.includeWorkspace !== undefined;
       if (hasIncludeLibrary !== hasIncludeWorkspace)
@@ -1238,7 +1276,7 @@ void (async () => {
       if (hasIncludeLibrary && (typeof cached.includeLibrary !== "boolean" ||
           typeof cached.includeWorkspace !== "boolean"))
         throw new Error("cache feed selection fields are not boolean");
-      if ((cached.songs || []).some((song) => !song || typeof song !== "object" || typeof song.id !== "string"))
+      if ((cached.songs || []).some((song) => !song || typeof song !== "object" || !validClipId(song.id)))
         throw new Error("cache contains an invalid song entry");
       if (new Set(cached.songs.map((song) => song.id)).size !== cached.songs.length)
         throw new Error("cache contains duplicate song IDs");
@@ -1248,7 +1286,7 @@ void (async () => {
       if ((cached.songs || []).some((song) => song.variationOutputBase !== undefined &&
           typeof song.variationOutputBase !== "string"))
         throw new Error("cache contains an invalid persisted variation filename");
-      if ((cached.seenIds || []).some((id) => typeof id !== "string"))
+      if ((cached.seenIds || []).some((id) => !validClipId(id)))
         throw new Error("cache contains an invalid seen ID");
       return cached;
     } catch (err) {
@@ -1459,7 +1497,8 @@ void (async () => {
       includeStems: stemsCheck.checked || INCLUDE_STEMS,
       creditApproved: false,
     };
-    if (!operationOptions.formats.mp3 && !operationOptions.formats.wav && !operationOptions.formats.midi) {
+    if (!operationOptions.formats.mp3 && !operationOptions.formats.wav &&
+        !operationOptions.formats.midi && !operationOptions.includeStems) {
       operationOptions = null;
       setStatus("Select at least one format before starting.");
       return;

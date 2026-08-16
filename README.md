@@ -67,20 +67,20 @@ Download all your songs from Suno as MP3, WAV, and MIDI with one paste into the 
 ## Resuming and re-scanning
 
 - **Rerun to resume** — the script skips songs that are already downloaded, so a stopped run picks up exactly where it left off.
-- **Re-scan for new songs** — if you've created songs since your last scan, click the "Re-scan for new songs" link. It scans forward until it reaches a full page of clips it has already seen, so it's fast even for large libraries.
+- **Re-scan for new songs** — if you've created songs since your last scan, click the "Re-scan for new songs" link. Suno's feeds are treated as newest-first, so the downloader stops after a full page of clips it has already seen. Delete `suno-cache.json` before rerunning if you need a guaranteed full rebuild instead of this fast incremental scan.
 - **Cache errors are not hidden** — if `suno-cache.json` is unreadable or malformed, the panel reports the problem instead of silently replacing resume state.
 
 ## First scan takes a few minutes
 
-Suno's feed returns your songs mixed in with a lot of generated stems, and there's no way to filter them out server-side. The first scan walks through all of them once to find your real songs. The progress panel shows how many clips it has scanned, so don't worry if it sits at "found 0 songs" for a while — that's just it grinding through stems, which are skipped automatically.
+Suno's feeds can return your songs mixed in with generated stems. The first scan walks through the returned clips to find your real songs. The progress panel shows how many clips it has scanned, so don't worry if it sits at "found 0 songs" for a while — it may be processing stems, which are skipped automatically unless you enabled them.
 
-The scan runs only once; `suno-cache.json` saves the result and every later run is instant.
+After a complete scan, `suno-cache.json` makes unchanged reruns instant. A partial scan, changed feed/stem settings, or an explicit re-scan can require more feed requests.
 
 ## Notes on usage
 
 - Songs downloaded with this tool may not be eligible for your commercial use. It is **your responsibility** to follow Suno's Terms of Service and any applicable license terms for the music you download.
-- This project is not affiliated with, endorsed by, or connected to Suno. It is an independent, personal-use tool that talks to the same public API the Suno web app uses, from your own logged-in browser session.
-- No credentials ever leave your browser. The script only uses your existing session; nothing is sent to anyone but Suno.
+- This project is not affiliated with, endorsed by, or connected to Suno. It is an independent, personal-use tool that talks to the same API endpoints used by the Suno web app, from your own logged-in browser session.
+- No credentials ever leave your browser. Authenticated API requests go only to Suno; media downloads use HTTPS audio URLs returned by Suno's feeds (normally Suno's CDN) and do not include your authorization header.
 
 ## Requirements
 
