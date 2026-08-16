@@ -138,7 +138,7 @@ void (async () => {
       <input type="checkbox" id="suno-dl-mp3"> MP3
     </label>
     <label style="display:flex;align-items:center;gap:8px;margin-bottom:6px;cursor:pointer">
-      <input type="checkbox" id="suno-dl-wav"> WAV (conversion uses credits)
+      <input type="checkbox" id="suno-dl-wav"> WAV (may require conversion)
     </label>
     <label style="display:flex;align-items:center;gap:8px;margin-bottom:6px;cursor:pointer">
       <input type="checkbox" id="suno-dl-midi"> MIDI (uses credits)
@@ -198,9 +198,8 @@ void (async () => {
       ? apiCredits.j.total_credits_left : null;
     if (balance !== null) {
       line += "Credits left: " + balance + "\n";
-      if (fmt.wav || fmt.midi) {
-        line += "WAV/MIDI conversions use credits - cost varies, watch your balance while running.";
-      }
+      if (fmt.wav) line += "WAV: an existing file is downloaded directly; a missing WAV may require conversion.\n";
+      if (fmt.midi) line += "MIDI conversion may use credits; watch your balance while running.";
     } else {
       line += "Could not read credit balance.";
     }
@@ -384,8 +383,8 @@ void (async () => {
     return null;
   };
 
-  const toEntry = (c) => {
-    const e = { id: c.id, title: String(c.title || "untitled").trim() };
+  const toEntry = (c, sourceFeed) => {
+    const e = { id: c.id, title: String(c.title || "untitled").trim(), sourceFeed };
     const audioUrl = clipAudioUrl(c);
     if (audioUrl) e.audioUrl = audioUrl;
     if (isStem(c)) {
@@ -418,9 +417,24 @@ void (async () => {
   // not satisfy a positive LIMIT before the re-scan has had a chance to inspect
   // any new pages; normal scans/resumes count every cached eligible item.
   let scanLimitBaselineIds = new Set();
+  let peerScanFailed = false;
   const eligibleScanCount = () => [...scanState.songs.values()].filter((entry) =>
     !scanLimitBaselineIds.has(entry.id) && (includeStems() || !entry.isStem)).length;
   const scanLimitReached = () => LIMIT > 0 && eligibleScanCount() >= LIMIT;
+  const scanRequestShouldStop = () => scanLimitReached() || peerScanFailed;
+
+  // A clip can appear in both concurrently requested feeds. Resolve it by a
+  // fixed source priority rather than response timing, and persist the source
+  // so partial-cache resumes make the same decision.
+  const sourcePriority = (source) => source === "library" ? 2 : source === "workspace" ? 1 : 0;
+  const upsertScanEntry = (clip, sourceFeed) => {
+    const entry = toEntry(clip, sourceFeed);
+    const previous = scanState.songs.get(clip.id);
+    if (previous && sourcePriority(previous.sourceFeed) > sourcePriority(sourceFeed)) return;
+    if (entry.isStem && previous?.stemOutputBase) entry.stemOutputBase = previous.stemOutputBase;
+    if (entry.isInfill && previous?.variationOutputBase) entry.variationOutputBase = previous.variationOutputBase;
+    scanState.songs.set(clip.id, entry);
+  };
 
   // during a re-scan we can stop a feed as soon as a page is 100% already-seen
   // (feeds are newest-first, so anything behind a fully-known page is known too)
@@ -475,14 +489,16 @@ void (async () => {
     let page = 0;
     const requestedCursors = new Set();
     do {
-      if (stopRequested || scanLimitReached()) break;
+      if (stopRequested || scanRequestShouldStop()) break;
       page++;
       if (page > MAX_SCAN_PAGES) throw new Error("library feed exceeded the pagination safety limit");
       requestedCursors.add(cursorKey(cursor));
       progress("Scanning library", page);
       const r = await api("POST", "/api/feed/v3", { cursor, limit: 50, filters: {} }, 5,
-        { stopWhen: scanLimitReached });
-      if (scanLimitReached()) break;
+        { stopWhen: scanRequestShouldStop });
+      if (peerScanFailed) return;
+      const limitReachedByPeer = scanLimitReached();
+      if (limitReachedByPeer && r.status === 0) break;
       if (r.status !== 200 && (stopRequested || destroyed)) return;
       if (r.status !== 200)
         throw new Error("library feed error " + r.status + ": " + (r.j?.raw || r.j?.detail || "unexpected response"));
@@ -490,6 +506,19 @@ void (async () => {
         throw new Error("library feed error: unexpected response shape");
       const nextCursor = responseCursor(r.j, "library");
       const clips = r.j.clips;
+      if (limitReachedByPeer) {
+        // This page was already in flight when the other feed met LIMIT. Do
+        // not consume its cursor or add new entries, but reconcile duplicate
+        // IDs so fixed feed priority still wins independently of timing.
+        for (const c of clips) {
+          if (!c || typeof c !== "object" || !validClipId(c.id))
+            throw new Error("library feed error: invalid clip entry");
+          if (scanState.songs.has(c.id) && c.status === "complete" && (includeStems() || !isStem(c)))
+            upsertScanEntry(c, "library");
+        }
+        await persist(dir);
+        break;
+      }
       scanState.scanned += clips.length;
       let known = 0;
       for (const c of clips) {
@@ -498,13 +527,7 @@ void (async () => {
         if (earlyStopLibrary && knownBeforeRescan.has(c.id)) known++;
         scanState.seenIds.add(c.id);
         if (c.status === "complete" && (includeStems() || !isStem(c))) {
-          const entry = toEntry(c);
-          const previous = scanState.songs.get(c.id);
-          if (entry.isStem && previous?.stemOutputBase)
-            entry.stemOutputBase = previous.stemOutputBase;
-          if (entry.isInfill && previous?.variationOutputBase)
-            entry.variationOutputBase = previous.variationOutputBase;
-          scanState.songs.set(c.id, entry);
+          upsertScanEntry(c, "library");
         }
       }
       cursor = nextCursor;
@@ -529,7 +552,7 @@ void (async () => {
     let page = 0;
     const requestedCursors = new Set();
     do {
-      if (stopRequested || scanLimitReached()) break;
+      if (stopRequested || scanRequestShouldStop()) break;
       page++;
       if (page > MAX_SCAN_PAGES) throw new Error("project feed exceeded the pagination safety limit");
       requestedCursors.add(cursorKey(cursor));
@@ -537,8 +560,10 @@ void (async () => {
       const qs = "?scope=default&limit=50" +
         (cursor ? `&cursor=${encodeURIComponent(queryCursor(cursor))}` : "");
       const r = await api("GET", "/api/project/feed" + qs, null, 5,
-        { stopWhen: scanLimitReached });
-      if (scanLimitReached()) break;
+        { stopWhen: scanRequestShouldStop });
+      if (peerScanFailed) return;
+      const limitReachedByPeer = scanLimitReached();
+      if (limitReachedByPeer && r.status === 0) break;
       if (r.status !== 200 && (stopRequested || destroyed)) return;
       if (r.status !== 200)
         throw new Error("project feed error " + r.status + ": " + (r.j?.raw || r.j?.detail || "unexpected response"));
@@ -546,6 +571,20 @@ void (async () => {
         throw new Error("project feed error: unexpected response shape");
       const nextCursor = responseCursor(r.j, "project");
       const items = r.j.items;
+      if (limitReachedByPeer) {
+        for (const it of items) {
+          if (!it || typeof it !== "object" || typeof it.type !== "string")
+            throw new Error("project feed error: invalid item entry");
+          const c = it.clip;
+          if (it.type !== "clip" || !c) continue;
+          if (typeof c !== "object" || !validClipId(c.id))
+            throw new Error("project feed error: invalid clip entry");
+          if (scanState.songs.has(c.id) && c.status === "complete" && (includeStems() || !isStem(c)))
+            upsertScanEntry(c, "workspace");
+        }
+        await persist(dir);
+        break;
+      }
       let scannedThisPage = 0;
       let known = 0;
       for (const it of items) {
@@ -559,13 +598,7 @@ void (async () => {
         if (earlyStopWorkspace && knownBeforeRescan.has(c.id)) known++;
         scanState.seenIds.add(c.id);
         if (c.status === "complete" && (includeStems() || !isStem(c))) {
-          const entry = toEntry(c);
-          const previous = scanState.songs.get(c.id);
-          if (entry.isStem && previous?.stemOutputBase)
-            entry.stemOutputBase = previous.stemOutputBase;
-          if (entry.isInfill && previous?.variationOutputBase)
-            entry.variationOutputBase = previous.variationOutputBase;
-          scanState.songs.set(c.id, entry);
+          upsertScanEntry(c, "workspace");
         }
       }
       scanState.scanned += scannedThisPage;
@@ -1000,7 +1033,9 @@ void (async () => {
     return new Blob([new Uint8Array(buf)], { type: "audio/midi" });
   }
 
-  const collisionKey = (name) => sanitize(name).normalize("NFC").toLowerCase();
+  // Uppercasing is a conservative Unicode case fold for filesystem purposes:
+  // unlike lowercasing it also joins pairs such as long-s/s and final-sigma/sigma.
+  const collisionKey = (name) => sanitize(name).normalize("NFC").toUpperCase();
   const idFingerprint = (value) => {
     // Two independent 32-bit hashes keep the suffix portable and distinguish
     // IDs that a case-insensitive filesystem considers equal.
@@ -1300,8 +1335,34 @@ void (async () => {
       if (hasIncludeLibrary && (typeof cached.includeLibrary !== "boolean" ||
           typeof cached.includeWorkspace !== "boolean"))
         throw new Error("cache feed selection fields are not boolean");
-      if ((cached.songs || []).some((song) => !song || typeof song !== "object" || !validClipId(song.id)))
+      if (cached.libDone === true && (cached.libCursor ?? null) !== null)
+        throw new Error("cache libDone contradicts libCursor");
+      if (cached.wsDone === true && (cached.wsCursor ?? null) !== null)
+        throw new Error("cache wsDone contradicts wsCursor");
+      if ((cached.songs || []).some((song) => !song || typeof song !== "object" || Array.isArray(song) || !validClipId(song.id)))
         throw new Error("cache contains an invalid song entry");
+      for (const song of cached.songs) {
+        if (song.title !== undefined && typeof song.title !== "string")
+          throw new Error("cache contains an invalid song title");
+        if (song.audioUrl !== undefined) {
+          if (typeof song.audioUrl !== "string")
+            throw new Error("cache contains an invalid song audio URL");
+          let parsedAudioUrl;
+          try { parsedAudioUrl = new URL(song.audioUrl); } catch {}
+          if (parsedAudioUrl?.protocol !== "https:")
+            throw new Error("cache contains an unsafe song audio URL");
+        }
+        if (song.isStem !== undefined && typeof song.isStem !== "boolean")
+          throw new Error("cache contains an invalid isStem flag");
+        if (song.isInfill !== undefined && typeof song.isInfill !== "boolean")
+          throw new Error("cache contains an invalid isInfill flag");
+        if (song.parentId !== undefined && typeof song.parentId !== "string")
+          throw new Error("cache contains an invalid parent ID");
+        if (song.stemName !== undefined && typeof song.stemName !== "string" && song.stemName !== null)
+          throw new Error("cache contains an invalid stem name");
+        if (song.sourceFeed !== undefined && !["library", "workspace"].includes(song.sourceFeed))
+          throw new Error("cache contains an invalid source feed");
+      }
       if (new Set(cached.songs.map((song) => song.id)).size !== cached.songs.length)
         throw new Error("cache contains duplicate song IDs");
       if ((cached.songs || []).some((song) => song.stemOutputBase !== undefined &&
@@ -1390,10 +1451,16 @@ void (async () => {
     // otherwise a later stem run would trust an incomplete stem collection.
     scanState.stemsIncluded = includeStems();
     const onProgress = (msg) => setStatus(msg);
+    peerScanFailed = false;
+    const guardedScan = async (scan) => {
+      try { await scan(); }
+      catch (error) { peerScanFailed = true; throw error; }
+    };
     const scans = await Promise.allSettled([
-      getLibrary(dir, onProgress, persistCache),
-      getWorkspace(dir, onProgress, persistCache),
+      guardedScan(() => getLibrary(dir, onProgress, persistCache)),
+      guardedScan(() => getWorkspace(dir, onProgress, persistCache)),
     ]);
+    peerScanFailed = false;
     const failedScan = scans.find((result) => result.status === "rejected");
     if (failedScan) throw failedScan.reason;
     if (scanLimitBaselineIds.size) {
@@ -1571,12 +1638,12 @@ void (async () => {
       const fmtNow = operationOptions.formats;
       if (fmtNow.wav || fmtNow.midi) {
         const parts = [];
-        if (fmtNow.wav) parts.push("WAV conversion");
-        if (fmtNow.midi) parts.push("MIDI conversion");
+        if (fmtNow.wav) parts.push("WAV download (a missing WAV may require conversion)");
+        if (fmtNow.midi) parts.push("MIDI conversion (may use credits)");
         if (!confirm(
           parts.join(" and ") +
-          " use your Suno credits and can drain your balance on a large library.\n\n" +
-          "MP3 downloads and already-generated stem downloads are free.\n\nContinue?"
+          ". Suno's WAV billing behavior is not assumed; check the displayed balance before and after a run.\n\n" +
+          "This downloader never generates songs or stems.\n\nContinue?"
         )) { setStatus("Cancelled."); return; }
         operationOptions.creditApproved = true;
       }

@@ -5,7 +5,7 @@ Download all your songs from Suno as MP3, WAV, and MIDI with one paste into the 
 ## Features
 
 - **Downloads your full Suno library + workspace** (auto-detected via Suno's own feed)
-- **MP3 and/or WAV and/or MIDI** — tick whichever you want (WAV/MIDI use Suno's converters, so they're slower per song)
+- **MP3 and/or WAV and/or MIDI** — tick whichever you want (missing WAV files and MIDI data may require Suno's converters, so they're slower per song)
 - **Stems support** — optionally download your already-generated stems as MP3s into each song's `stems/` folder (`Vocals.mp3`, `Drums.mp3`, ...), regardless of the full-song format selection; repeated names get stable clip-ID suffixes as needed so none overwrite each other or change names on later re-scans
 - **Section-edit clips grouped** — Suno's "replace section" variations (e.g. `[01:55.0 - 02:18.4] {verse]`) are filed under their parent song's `variations/` folder
 - **Per-song folders** — one unique folder per song (`<title> [<id>]/`), so duplicate titles never collide; unsafe or overlong filename characters are normalized for portability (with the Chrome/Edge folder picker)
@@ -31,11 +31,11 @@ Download all your songs from Suno as MP3, WAV, and MIDI with one paste into the 
 
 7. A small panel appears. Tick the formats you want:
    - **MP3** — fast, works for every song
-   - **WAV** — Suno converts each song first, which uses credits and is slower (a few seconds to ~30s per song)
+   - **WAV** — downloads an existing WAV directly; if none exists, Suno may need to convert it first
    - **MIDI** — Suno converts each song to note data (slowest, ~1-2 min per song). **Uses your account credits.**
    - **Include stems** — also downloads your existing stems (only if you have them). Stems must have been generated in Suno first (click "Get stems" on a song in Suno, which costs credits) — this tool only *downloads* stems that already exist, it never generates them.
 
-> **Warning: WAV and MIDI conversion can eat your credits quickly.** Both depend on Suno's on-demand converters, which consume account credits per conversion. With a large library the conversions can add up fast — e.g. converting a few hundred songs may drain a 10,000-credit Premier balance. MP3 downloads and already-existing stem downloads are free; watch your remaining balance (shown in Suno's sidebar) while a run is in progress, and rerun after credits refresh to grab anything that was skipped.
+> **Conversion warning:** MIDI conversion may use account credits. For WAV, the downloader first checks for an existing file and downloads it directly; only a missing WAV triggers a conversion request. Suno's general WAV billing policy is not assumed here, so compare the displayed credit balance before and after a bounded run if that matters to you. This downloader never generates songs or stems.
 
 8. Click **Choose folder...** and pick where to save your songs.
 
@@ -66,7 +66,7 @@ Download all your songs from Suno as MP3, WAV, and MIDI with one paste into the 
 
 ## Resuming and re-scanning
 
-- **Rerun to resume** — the script skips songs that are already downloaded, so a stopped run picks up exactly where it left off.
+- **Rerun to resume** — the script skips each already-downloaded format file, so a stopped run continues with missing files and newly selected formats.
 - **Re-scan for new songs** — if you've created songs since your last scan, click the "Re-scan for new songs" link. Suno's feeds are treated as newest-first, so the downloader stops after a full page of clips it has already seen. Delete `suno-cache.json` before rerunning if you need a guaranteed full rebuild instead of this fast incremental scan.
 - **Cache errors are not hidden** — if `suno-cache.json` is unreadable or malformed, the panel reports the problem instead of silently replacing resume state.
 
