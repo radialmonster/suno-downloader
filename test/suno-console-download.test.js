@@ -305,6 +305,17 @@ test("initializes one panel and re-paste destroys the old instance", async () =>
   assert.equal(runtime.document.querySelectorAll("#suno-bulk-downloader-panel").length, 1);
 });
 
+test("INCLUDE_STEMS presets the visible checkbox and can be unchecked", async () => {
+  const runtime = createRuntime({
+    script: SCRIPT.replace("const INCLUDE_STEMS = false", "const INCLUDE_STEMS = true"),
+  });
+  runtime.run();
+  const stems = runtime.element("suno-dl-stems");
+  assert.equal(stems.checked, true);
+  stems.checked = false;
+  assert.equal(stems.checked, false);
+});
+
 test("re-paste aborts an old in-flight scan before it can overlap", async () => {
   let feedAttempts = 0;
   const runtime = createRuntime({
@@ -1146,6 +1157,183 @@ test("feed requests use current parameters and paginate from next_cursor without
   assert.equal(secondQuery.get("scope"), "default");
   assert.equal(secondQuery.get("limit"), "50");
   assert.equal(secondQuery.get("cursor"), "workspace cursor");
+});
+
+test("a positive LIMIT stops scanning after enough eligible items are found", async () => {
+  const directory = new MemoryDirectory();
+  let libraryPage = 0;
+  const runtime = createRuntime({
+    directory,
+    script: SCRIPT
+      .replace("const LIMIT = 0", "const LIMIT = 1")
+      .replace("const INCLUDE_WORKSPACE = true", "const INCLUDE_WORKSPACE = false"),
+    fetch: async (url) => {
+      url = String(url);
+      runtime.calls.push({ url });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 1 });
+      if (url.endsWith("/api/feed/v3")) {
+        libraryPage++;
+        if (libraryPage === 1) return jsonResponse({ clips: [{
+          id: "limitstem001", title: "Vocals", status: "complete",
+          metadata: { stem_from_id: "parentlimit1", stem_task: true },
+        }], next_cursor: "after stems" });
+        if (libraryPage === 2) return jsonResponse({ clips: [{
+          id: "limitsong001", title: "Limited song", status: "complete", metadata: {},
+        }], next_cursor: "unread page" });
+        throw new Error("LIMIT requested an unnecessary feed page");
+      }
+      if (url.startsWith("https://cdn1.suno.ai/"))
+        return new Response(new Blob([MP3_BYTES]), { status: 200, headers: { "content-type": "audio/mpeg" } });
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "limited scan did not finish", 3000);
+  assert.equal(libraryPage, 2, "LIMIT did not stop after the first eligible item");
+  assert.ok(directory.paths().some((name) => name.endsWith("Limited song.mp3")));
+  const cache = JSON.parse(await (await directory.getFileHandle("suno-cache.json")).getFile().then((file) => file.text()));
+  assert.equal(cache.libDone, false);
+  assert.equal(cache.libCursor, "unread page");
+  assert.deepEqual(cache.songs.map((song) => song.id), ["limitsong001"]);
+});
+
+test("a partial cache satisfying LIMIT downloads without resuming the feed", async () => {
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "cachedlimit01", title: "Cached limited song" },
+  ], {
+    libCursor: "resume later",
+    libDone: false,
+    includeLibrary: true,
+    includeWorkspace: false,
+  }));
+  const runtime = createRuntime({
+    directory,
+    script: SCRIPT
+      .replace("const LIMIT = 0", "const LIMIT = 1")
+      .replace("const INCLUDE_WORKSPACE = true", "const INCLUDE_WORKSPACE = false"),
+  });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "limited cache download did not finish", 3000);
+  assert.equal(runtime.calls.some((call) => call.url.endsWith("/api/feed/v3")), false,
+    "a cache already satisfying LIMIT resumed the feed");
+  assert.ok(directory.paths().some((name) => name.endsWith("Cached limited song.mp3")));
+});
+
+test("raising LIMIT resumes a partial cache from its saved cursor", async () => {
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "cachedlimit01", title: "First cached song" },
+  ], {
+    libCursor: "resume here",
+    libDone: false,
+    includeLibrary: true,
+    includeWorkspace: false,
+  }));
+  let requestedBody;
+  const runtime = createRuntime({
+    directory,
+    script: SCRIPT
+      .replace("const LIMIT = 0", "const LIMIT = 2")
+      .replace("const INCLUDE_WORKSPACE = true", "const INCLUDE_WORKSPACE = false"),
+    fetch: async (url, init = {}) => {
+      url = String(url);
+      runtime.calls.push({ url, init });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 1 });
+      if (url.endsWith("/api/feed/v3")) {
+        requestedBody = JSON.parse(init.body);
+        return jsonResponse({ clips: [{
+          id: "resumedlimit2", title: "Second resumed song", status: "complete", metadata: {},
+        }], next_cursor: "still more" });
+      }
+      if (url.startsWith("https://cdn1.suno.ai/"))
+        return new Response(new Blob([MP3_BYTES]), { status: 200, headers: { "content-type": "audio/mpeg" } });
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "raised-limit resume did not finish", 3000);
+  assert.equal(requestedBody.cursor, "resume here");
+  assert.equal(runtime.calls.filter((call) => call.url.endsWith("/api/feed/v3")).length, 1);
+  const media = directory.paths().filter((name) => name.endsWith(".mp3"));
+  assert.equal(media.length, 2);
+  const cache = JSON.parse(await (await directory.getFileHandle("suno-cache.json")).getFile().then((file) => file.text()));
+  assert.equal(cache.libCursor, "still more");
+  assert.equal(cache.libDone, false);
+});
+
+test("reaching LIMIT in one feed prevents retries in the other feed", async () => {
+  const directory = new MemoryDirectory();
+  let workspaceAttempts = 0;
+  const runtime = createRuntime({
+    directory,
+    script: SCRIPT.replace("const LIMIT = 0", "const LIMIT = 1"),
+    fetch: async (url) => {
+      url = String(url);
+      runtime.calls.push({ url });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 1 });
+      if (url.endsWith("/api/feed/v3")) return jsonResponse({ clips: [{
+        id: "limitwins001", title: "Limit winner", status: "complete", metadata: {},
+      }], next_cursor: "library more" });
+      if (url.includes("/api/project/feed")) {
+        workspaceAttempts++;
+        return jsonResponse({ detail: "temporary failure" }, 500);
+      }
+      if (url.startsWith("https://cdn1.suno.ai/"))
+        return new Response(new Blob([MP3_BYTES]), { status: 200, headers: { "content-type": "audio/mpeg" } });
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "cross-feed LIMIT scan did not finish", 3000);
+  assert.equal(workspaceAttempts, 1, "the concurrent feed retried after LIMIT was reached");
+  assert.match(runtime.status(), /1 downloaded, 0 skipped, 0 failed/);
+});
+
+test("a limited manual re-scan prioritizes newly discovered items", async () => {
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "oldlimit0001", title: "Older cached song" },
+  ], {
+    includeLibrary: true,
+    includeWorkspace: false,
+  }));
+  let libraryCalls = 0;
+  const runtime = createRuntime({
+    directory,
+    script: SCRIPT
+      .replace("const LIMIT = 0", "const LIMIT = 1")
+      .replace("const INCLUDE_WORKSPACE = true", "const INCLUDE_WORKSPACE = false"),
+    fetch: async (url) => {
+      url = String(url);
+      runtime.calls.push({ url });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 1 });
+      if (url.endsWith("/api/feed/v3")) {
+        libraryCalls++;
+        return jsonResponse({ clips: [{
+          id: "newlimit0001", title: "Newest discovered song", status: "complete", metadata: {},
+        }], next_cursor: "older unread" });
+      }
+      if (url.startsWith("https://cdn1.suno.ai/"))
+        return new Response(new Blob([MP3_BYTES]), { status: 200, headers: { "content-type": "audio/mpeg" } });
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  const rescan = runtime.document.walk().find((element) => element.textContent === "Re-scan for new songs");
+  rescan.click();
+  await waitFor(() => /Re-scan complete/.test(runtime.status()), "limited manual re-scan did not finish", 3000);
+  assert.equal(libraryCalls, 1);
+  let cache = JSON.parse(await (await directory.getFileHandle("suno-cache.json")).getFile().then((file) => file.text()));
+  assert.deepEqual(cache.songs.map((song) => song.id), ["newlimit0001", "oldlimit0001"]);
+  assert.equal(cache.libDone, false);
+  assert.equal(cache.libCursor, "older unread");
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "post-rescan limited download did not finish", 3000);
+  const media = directory.paths().filter((name) => name.endsWith(".mp3"));
+  assert.equal(media.length, 1);
+  assert.ok(media[0].endsWith("Newest discovered song.mp3"));
 });
 
 test("a contradictory has_more signal fails closed", async () => {

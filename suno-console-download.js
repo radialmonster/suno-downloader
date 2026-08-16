@@ -54,10 +54,10 @@ void (async () => {
   document.getElementById("suno-bulk-downloader-panel")?.remove();
 
   const FORMAT = "mp3"; // default checkbox preset: 'mp3', 'wav', or 'both' (MIDI is selected in the panel)
-  const LIMIT = 0; // 0 = all download items, or N = first N song/stem/variation entries
+  const LIMIT = 0; // 0 = scan/download all items; N = stop scanning after enough eligible items, then download the first N
   const INCLUDE_LIBRARY = true; // your Suno library (created + liked songs)
   const INCLUDE_WORKSPACE = true; // your workspace (drafts/in-progress)
-  const INCLUDE_STEMS = false; // also download already-generated stems (no credits needed)
+  const INCLUDE_STEMS = false; // default checkbox preset for already-generated stems (no credits needed)
   const PAUSE_MS = 1500; // delay between songs (be polite to the API)
   const MAX_SCAN_PAGES = 10000; // final backstop for a broken endlessly-paginated API
 
@@ -161,9 +161,10 @@ void (async () => {
   const creditsBox = panel.querySelector("#suno-dl-credits");
   const setStatus = (t) => { if (!destroyed) status.textContent = t; };
   let operationOptions = null;
-  const includeStems = () => operationOptions ? operationOptions.includeStems : (stemsCheck.checked || INCLUDE_STEMS);
+  const includeStems = () => operationOptions ? operationOptions.includeStems : stemsCheck.checked;
   mp3Check.checked = FORMAT === "mp3" || FORMAT === "both";
   wavCheck.checked = FORMAT === "wav" || FORMAT === "both";
+  stemsCheck.checked = INCLUDE_STEMS;
   const getFormats = () => ({
     mp3: mp3Check.checked,
     wav: wavCheck.checked,
@@ -216,10 +217,11 @@ void (async () => {
     return { Authorization: "Bearer " + token, "Content-Type": "application/json" };
   };
   const api = async (method, p, body, retries = 5, options = {}) => {
-    const { retryAmbiguous = true, reportStatus = true } = options;
+    const { retryAmbiguous = true, reportStatus = true, stopWhen = () => false } = options;
     let refreshToken = false;
     for (let i = 0; i <= retries; i++) {
       const signal = operationController?.signal || instanceController.signal;
+      if (stopWhen()) return { status: 0, j: { raw: "request stopped after reaching limit" } };
       if (destroyed || stopRequested || signal.aborted)
         return { status: 0, j: { raw: "request stopped" } };
       let res;
@@ -258,7 +260,8 @@ void (async () => {
         }
         const wait = Math.min(1000 * Math.pow(2, i), 30000);
         if (reportStatus) setStatus("Network error - retrying in " + (wait / 1000) + "s...");
-        await stopSleep(wait);
+        await stopSleep(wait, stopWhen);
+        if (stopWhen()) return { status: 0, j: { raw: "request stopped after reaching limit" } };
         if (stopRequested) return { status: 0, j: { raw: "request stopped" } };
         continue;
       }
@@ -274,7 +277,8 @@ void (async () => {
         signal.removeEventListener("abort", abortRequest);
         const wait = Math.min(2000 * Math.pow(2, i), 60000); // exponential: 2s,4s,8s,... max 60s
         if (reportStatus) setStatus("Rate limited - waiting " + (wait / 1000) + "s...");
-        await stopSleep(wait);
+        await stopSleep(wait, stopWhen);
+        if (stopWhen()) return { status: 0, j: { raw: "request stopped after reaching limit" } };
         if (destroyed || stopRequested || signal.aborted)
           return { status: 0, j: { raw: "request stopped" } };
         continue;
@@ -284,7 +288,8 @@ void (async () => {
         signal.removeEventListener("abort", abortRequest);
         const wait = Math.min(1000 * Math.pow(2, i), 30000);
         if (reportStatus) setStatus("Server error " + res.status + " - retrying in " + (wait / 1000) + "s...");
-        await stopSleep(wait);
+        await stopSleep(wait, stopWhen);
+        if (stopWhen()) return { status: 0, j: { raw: "request stopped after reaching limit" } };
         if (destroyed || stopRequested || signal.aborted)
           return { status: 0, j: { raw: "request stopped" } };
         continue;
@@ -313,7 +318,8 @@ void (async () => {
           return { status: 0, j: { raw: (timedOut ? "response timed out" : "response body failed") + " after retries: " + (err?.message || err) } };
         const wait = Math.min(1000 * Math.pow(2, i), 30000);
         if (reportStatus) setStatus("Network error - retrying in " + (wait / 1000) + "s...");
-        await stopSleep(wait);
+        await stopSleep(wait, stopWhen);
+        if (stopWhen()) return { status: 0, j: { raw: "request stopped after reaching limit" } };
         continue;
       }
       clearTimeout(timeout);
@@ -393,8 +399,8 @@ void (async () => {
     return e;
   };
 
-  const stopSleep = async (ms) => {
-    for (let waited = 0; waited < ms && !stopRequested; waited += 100) await sleep(100);
+  const stopSleep = async (ms, shouldStop = () => false) => {
+    for (let waited = 0; waited < ms && !stopRequested && !shouldStop(); waited += 100) await sleep(100);
   };
 
   // shared scan state, persisted to the cache file after every page
@@ -408,6 +414,13 @@ void (async () => {
     stemsIncluded: false,
     scanned: 0,
   };
+  // Manual re-scans seed the map from the existing cache. Those old entries do
+  // not satisfy a positive LIMIT before the re-scan has had a chance to inspect
+  // any new pages; normal scans/resumes count every cached eligible item.
+  let scanLimitBaselineIds = new Set();
+  const eligibleScanCount = () => [...scanState.songs.values()].filter((entry) =>
+    !scanLimitBaselineIds.has(entry.id) && (includeStems() || !entry.isStem)).length;
+  const scanLimitReached = () => LIMIT > 0 && eligibleScanCount() >= LIMIT;
 
   // during a re-scan we can stop a feed as soon as a page is 100% already-seen
   // (feeds are newest-first, so anything behind a fully-known page is known too)
@@ -462,12 +475,14 @@ void (async () => {
     let page = 0;
     const requestedCursors = new Set();
     do {
-      if (stopRequested) break;
+      if (stopRequested || scanLimitReached()) break;
       page++;
       if (page > MAX_SCAN_PAGES) throw new Error("library feed exceeded the pagination safety limit");
       requestedCursors.add(cursorKey(cursor));
       progress("Scanning library", page);
-      const r = await api("POST", "/api/feed/v3", { cursor, limit: 50, filters: {} });
+      const r = await api("POST", "/api/feed/v3", { cursor, limit: 50, filters: {} }, 5,
+        { stopWhen: scanLimitReached });
+      if (scanLimitReached()) break;
       if (r.status !== 200 && (stopRequested || destroyed)) return;
       if (r.status !== 200)
         throw new Error("library feed error " + r.status + ": " + (r.j?.raw || r.j?.detail || "unexpected response"));
@@ -498,6 +513,7 @@ void (async () => {
       scanState.libCursor = cursor;
       if (!cursor) scanState.libDone = true;
       await persist(dir);
+      if (scanLimitReached()) break;
       if (earlyStopLibrary && clips.length && known === clips.length) {
         scanState.libDone = true;
         scanState.libCursor = null;
@@ -513,14 +529,16 @@ void (async () => {
     let page = 0;
     const requestedCursors = new Set();
     do {
-      if (stopRequested) break;
+      if (stopRequested || scanLimitReached()) break;
       page++;
       if (page > MAX_SCAN_PAGES) throw new Error("project feed exceeded the pagination safety limit");
       requestedCursors.add(cursorKey(cursor));
       progress("Scanning workspace", page);
       const qs = "?scope=default&limit=50" +
         (cursor ? `&cursor=${encodeURIComponent(queryCursor(cursor))}` : "");
-      const r = await api("GET", "/api/project/feed" + qs);
+      const r = await api("GET", "/api/project/feed" + qs, null, 5,
+        { stopWhen: scanLimitReached });
+      if (scanLimitReached()) break;
       if (r.status !== 200 && (stopRequested || destroyed)) return;
       if (r.status !== 200)
         throw new Error("project feed error " + r.status + ": " + (r.j?.raw || r.j?.detail || "unexpected response"));
@@ -557,6 +575,7 @@ void (async () => {
       scanState.wsCursor = cursor;
       if (!cursor) scanState.wsDone = true;
       await persist(dir);
+      if (scanLimitReached()) break;
       if (earlyStopWorkspace && scannedThisPage && known === scannedThisPage) {
         scanState.wsDone = true;
         scanState.wsCursor = null;
@@ -1377,6 +1396,17 @@ void (async () => {
     ]);
     const failedScan = scans.find((result) => result.status === "rejected");
     if (failedScan) throw failedScan.reason;
+    if (scanLimitBaselineIds.size) {
+      // A manual re-scan discovers newest items after seeding older cached ones.
+      // Put those discoveries first so LIMIT selects what the re-scan just found,
+      // and persist that same deterministic priority for the next run.
+      const entries = [...scanState.songs.values()];
+      const prioritized = [
+        ...entries.filter((entry) => !scanLimitBaselineIds.has(entry.id)),
+        ...entries.filter((entry) => scanLimitBaselineIds.has(entry.id)),
+      ];
+      scanState.songs = new Map(prioritized.map((entry) => [entry.id, entry]));
+    }
     assignStableOutputBases();
     await persistCache(dir);
     let out = [...scanState.songs.values()];
@@ -1411,7 +1441,11 @@ void (async () => {
       : (cached.songs || []).some((s) => s.isStem));
     const needStemRescan = cached && includeStems() && !cacheIncludedStems;
     const needFeedRescan = cached && !cacheMatchesFeedSelection(cached);
-    if (cached && !rescan && !needStemRescan && !needFeedRescan && cached.libDone && cached.wsDone) {
+    const cachedEligibleCount = cached
+      ? cached.songs.filter((entry) => includeStems() || !entry.isStem).length : 0;
+    const cacheSatisfiesLimit = LIMIT > 0 && cachedEligibleCount >= LIMIT;
+    if (cached && !rescan && !needStemRescan && !needFeedRescan &&
+        ((cached.libDone && cached.wsDone) || cacheSatisfiesLimit)) {
       restoreScanState(cached);
       if (assignStableOutputBases()) await persistCache(dir);
       if (operationCancelled()) {
@@ -1428,6 +1462,7 @@ void (async () => {
     }
     earlyStopLibrary = false; // normal/partial-cache scans resume from their saved cursors
     earlyStopWorkspace = false;
+    scanLimitBaselineIds = new Set();
     if (cached && !needFeedRescan) restoreScanState(cached);
     else resetScanState();
     if (needStemRescan && !needFeedRescan) {
@@ -1506,7 +1541,7 @@ void (async () => {
     if (busy || destroyed) return;
     operationOptions = {
       formats: getFormats(),
-      includeStems: stemsCheck.checked || INCLUDE_STEMS,
+      includeStems: stemsCheck.checked,
       creditApproved: false,
     };
     if (!operationOptions.formats.mp3 && !operationOptions.formats.wav &&
@@ -1599,7 +1634,7 @@ void (async () => {
       if (busy || destroyed) return;
       operationOptions = {
         formats: getFormats(),
-        includeStems: stemsCheck.checked || INCLUDE_STEMS,
+        includeStems: stemsCheck.checked,
       };
       operationController = new AbortController();
       setBusy(true);
@@ -1639,6 +1674,7 @@ void (async () => {
           // that an earlier run already downloaded.
           assignStableOutputBases();
         }
+        scanLimitBaselineIds = new Set(scanState.songs.keys());
         const { songs: fresh } = await enumerateSongs(dir);
         if (stopRequested) {
           rescan = false;
@@ -1654,6 +1690,7 @@ void (async () => {
         earlyStopLibrary = false;
         earlyStopWorkspace = false;
         knownBeforeRescan = new Set();
+        scanLimitBaselineIds = new Set();
         setStatus(`Re-scan complete: ${songs.length} download items.\nClick "Start" to download.`);
       } catch (e) {
         rescan = false;
@@ -1667,6 +1704,7 @@ void (async () => {
         operationController = null;
         operationOptions = null;
         knownBeforeRescan = new Set();
+        scanLimitBaselineIds = new Set();
         stopRequested = false;
         setBusy(false);
       }

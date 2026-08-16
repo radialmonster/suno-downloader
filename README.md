@@ -76,6 +76,8 @@ Suno's feeds can return your songs mixed in with generated stems. The first scan
 
 After a complete scan, `suno-cache.json` makes unchanged reruns instant. A partial scan, changed feed/stem settings, or an explicit re-scan can require more feed requests.
 
+If you set the source-level `LIMIT` option above zero, the downloader stops requesting subsequent pages once enough eligible download items have been found (a page already in flight from the other feed may still finish). With the folder picker, the partial cursors are cached, so increasing or removing the limit later resumes from that point instead of restarting the feed walk. An explicit re-scan counts newly discovered items toward the limit and places them before older cached items.
+
 ## Notes on usage
 
 - Songs downloaded with this tool may not be eligible for your commercial use. It is **your responsibility** to follow Suno's Terms of Service and any applicable license terms for the music you download.
