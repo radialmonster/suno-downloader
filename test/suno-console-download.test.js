@@ -28,6 +28,20 @@ const WAV_BYTES = new Uint8Array([
   0x64, 0x61, 0x74, 0x61, 0x01, 0x00, 0x00, 0x00, // data, one byte
   0x80, 0x00,                                     // sample plus RIFF padding
 ]);
+const JPEG_BYTES = new Uint8Array(Buffer.from(
+  "/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMU" +
+  "FRUVDA8XGBYUGBIUFRT/2wBDAQMEBAUEBQkFBQkUDQsNFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU" +
+  "FBQUFBQUFBT/wAARCAABAAEDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFB" +
+  "AQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV" +
+  "1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4" +
+  "+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAx" +
+  "EEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2h" +
+  "panN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP" +
+  "09fb3+Pn6/9oADAMBAAIRAxEAPwD50ooor8MP9Uz/2Q==", "base64"));
+const MALFORMED_JPEG_BYTES = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0xff, 0xd9]);
+const PNG_BYTES = new Uint8Array(Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"));
+const WEBP_BYTES = new Uint8Array(Buffer.from("UklGRhwAAABXRUJQVlA4TA8AAAAvAUAAAAcQ9Y/+ByKi/wEA", "base64"));
 async function waitFor(predicate, message, timeoutMs = 1500) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -547,7 +561,8 @@ test("busy operations lock formats, folder selection, Start, and re-scan", async
   const runtime = createRuntime({ pick: () => picker });
   runtime.run();
   runtime.element("suno-dl-btn").click();
-  for (const id of ["suno-dl-mp3", "suno-dl-wav", "suno-dl-midi", "suno-dl-stems", "suno-dl-pick", "suno-dl-btn"])
+  for (const id of ["suno-dl-mp3", "suno-dl-wav", "suno-dl-midi", "suno-dl-stems",
+    "suno-dl-info", "suno-dl-cover", "suno-dl-pick", "suno-dl-btn"])
     assert.equal(runtime.element(id).disabled, true, id + " should be disabled");
   const rescan = runtime.document.walk().find((element) => element.textContent === "Re-scan for new songs");
   assert.equal(rescan.getAttribute("aria-disabled"), "true");
@@ -2731,6 +2746,11 @@ for (const [field, value, message] of [
   ["stemName", [], /invalid stem name/i],
   ["sourceFeed", "other", /invalid source feed/i],
   ["audioUrl", "http://cdn.example/song.mp3", /unsafe song audio URL/i],
+  ["styles", {}, /invalid song styles/i],
+  ["imageUrl", "http://img.example/song.jpg", /unsafe song image URL/i],
+  ["imageFallbackUrl", 7, /invalid song image URL/i],
+  ["duration", "3", /invalid song duration/i],
+  ["instrumental", "false", /invalid song instrumental flag/i],
   ["stemOutputBase", 7, /invalid persisted stem filename/i],
   ["variationOutputBase", {}, /invalid persisted variation filename/i],
   ["folderOutputBase", [], /invalid persisted song folder name/i],
@@ -3317,6 +3337,389 @@ test("a later orphan-parent collision does not move the existing orphan folder",
   assert.equal(cache.songs.find((song) => song.id === oldStem.id).orphanFolderOutputBase, "Missing parent [PARENT]");
   assert.notEqual(cache.songs.find((song) => song.id === "neworphan01").orphanFolderOutputBase,
     "Missing parent [parent]");
+});
+
+test("companion presets match visible controls and remain user-editable", async () => {
+  const runtime = createRuntime({
+    script: SCRIPT
+      .replace("const INCLUDE_INFO = false", "const INCLUDE_INFO = true")
+      .replace("const INCLUDE_COVER = false", "const INCLUDE_COVER = true"),
+  });
+  runtime.run();
+  assert.equal(runtime.element("suno-dl-info").checked, true);
+  assert.equal(runtime.element("suno-dl-cover").checked, true);
+  runtime.element("suno-dl-info").checked = false;
+  runtime.element("suno-dl-cover").checked = false;
+  assert.equal(runtime.element("suno-dl-info").checked, false);
+  assert.equal(runtime.element("suno-dl-cover").checked, false);
+});
+
+test("a companion-only run saves UTF-8 song info and a validated cover without paid endpoints", async () => {
+  const imageUrl = "https://img.example/archive.jpg";
+  const clip = {
+    id: "companion001", title: "Archive song", status: "complete", image_url: imageUrl,
+    created_at: "2026-01-02T03:04:05Z", model_name: "chirp-test", major_model_version: "v9",
+    display_name: "Example Creator", handle: "example",
+    metadata: {
+      tags: "dream pop, warm synths", prompt: "[Verse]\nUnicode lyric: café 雨",
+      gpt_description_prompt: "A hazy midnight pop song", duration: 123.5, make_instrumental: false,
+    },
+  };
+  const directory = new MemoryDirectory();
+  const runtime = createRuntime({
+    directory,
+    fetch: async (url) => {
+      url = String(url);
+      runtime.calls.push({ url });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 5 });
+      if (url.endsWith("/api/feed/v3")) return jsonResponse({ clips: [clip], next_cursor: null });
+      if (url.includes("/api/project/feed")) return jsonResponse({ items: [], next_cursor: null });
+      if (url === imageUrl)
+        return new Response(new Blob([JPEG_BYTES]), { status: 200, headers: { "content-type": "image/jpeg" } });
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-mp3").checked = false;
+  runtime.element("suno-dl-info").checked = true;
+  runtime.element("suno-dl-cover").checked = true;
+  runtime.element("suno-dl-btn").click();
+  runtime.element("suno-dl-info").checked = false;
+  runtime.element("suno-dl-cover").checked = false;
+  await waitFor(() => /^Done\./.test(runtime.status()), "companion-only run did not finish", 3000);
+  const songDir = [...directory.directories.values()][0];
+  assert.ok(songDir.files.has("Archive song.txt"));
+  assert.ok(songDir.files.has("Archive song.jpg"));
+  const info = await songDir.files.get("Archive song.txt").getFile().then((file) => file.text());
+  assert.match(info, /Styles \/ genre:\ndream pop, warm synths/);
+  assert.match(info, /Description prompt:\nA hazy midnight pop song/);
+  assert.match(info, /Lyrics:\n\[Verse\]\nUnicode lyric: café 雨/);
+  assert.match(info, /Creator: Example Creator/);
+  const cache = JSON.parse(await directory.files.get("suno-cache.json").getFile().then((file) => file.text()));
+  assert.equal(cache.companionMetadataIncluded, true);
+  assert.equal(cache.songs[0].styles, "dream pop, warm synths");
+  assert.equal(cache.songs[0].imageUrl, imageUrl);
+  assert.equal(runtime.calls.some((call) => /convert_|midi|stem/i.test(call.url)), false);
+  assert.equal(runtime.calls.some((call) => /cdn1\.suno\.ai/.test(call.url)), false);
+});
+
+test("requesting companions migrates a legacy complete cache with a full read-only re-scan", async () => {
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "legacyinfo01", title: "Legacy info" },
+  ]));
+  let libraryReads = 0;
+  const runtime = createRuntime({
+    directory,
+    fetch: async (url) => {
+      url = String(url);
+      runtime.calls.push({ url });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 5 });
+      if (url.endsWith("/api/feed/v3")) {
+        libraryReads++;
+        return jsonResponse({ clips: [{
+          id: "legacyinfo01", title: "Legacy info", status: "complete",
+          metadata: { tags: "rescanned style", prompt: "rescanned lyrics" },
+        }], next_cursor: null });
+      }
+      if (url.includes("/api/project/feed")) return jsonResponse({ items: [], next_cursor: null });
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-mp3").checked = false;
+  runtime.element("suno-dl-info").checked = true;
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "legacy companion migration did not finish", 3000);
+  assert.equal(libraryReads, 1);
+  const songDir = [...directory.directories.values()][0];
+  const info = await songDir.files.get("Legacy info.txt").getFile().then((file) => file.text());
+  assert.match(info, /rescanned style/);
+  assert.match(info, /rescanned lyrics/);
+});
+
+test("duplicate feed records retain missing companion metadata from the lower-priority source", async () => {
+  const directory = new MemoryDirectory();
+  const runtime = createRuntime({
+    directory,
+    fetch: async (url) => {
+      url = String(url);
+      runtime.calls.push({ url });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 5 });
+      if (url.endsWith("/api/feed/v3")) return jsonResponse({ clips: [{
+        id: "sharedmeta01", title: "Library title", status: "complete", metadata: { tags: "library style" },
+      }], next_cursor: null });
+      if (url.includes("/api/project/feed")) return jsonResponse({ items: [{ type: "clip", clip: {
+        id: "sharedmeta01", title: "Workspace title", status: "complete", metadata: { prompt: "workspace lyrics" },
+      } }], next_cursor: null });
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-mp3").checked = false;
+  runtime.element("suno-dl-info").checked = true;
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "duplicate metadata run did not finish", 3000);
+  const cache = JSON.parse(await directory.files.get("suno-cache.json").getFile().then((file) => file.text()));
+  assert.equal(cache.songs.length, 1);
+  assert.equal(cache.songs[0].title, "Library title");
+  assert.equal(cache.songs[0].sourceFeed, "library");
+  assert.equal(cache.songs[0].styles, "library style");
+  assert.equal(cache.songs[0].lyrics, "workspace lyrics");
+});
+
+test("an invalid cover body is rejected and never saved as an image", async () => {
+  const imageUrl = "https://img.example/not-an-image.png";
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "badcover001", title: "Bad cover", imageUrl },
+  ], { companionMetadataIncluded: true }));
+  const runtime = createRuntime({
+    directory,
+    fetch: async (url) => {
+      url = String(url);
+      runtime.calls.push({ url });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 5 });
+      if (url === imageUrl)
+        return new Response(new Blob([MALFORMED_JPEG_BYTES]), { status: 200, headers: { "content-type": "image/jpeg" } });
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-mp3").checked = false;
+  runtime.element("suno-dl-cover").checked = true;
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "invalid cover run did not finish", 3000);
+  assert.match(runtime.status(), /0 downloaded, 0 skipped, 1 failed/);
+  assert.equal(directory.paths().some((name) => /Bad cover\.(?:jpg|png|webp)$/.test(name)), false);
+});
+
+for (const [extension, bytes, contentType] of [
+  ["png", PNG_BYTES, "image/png"],
+  ["webp", WEBP_BYTES, "image/webp"],
+]) {
+  test("a structurally valid " + extension.toUpperCase() + " cover uses its detected extension", async () => {
+    const imageUrl = "https://img.example/valid-cover." + extension;
+    const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+      { id: "valid" + extension + "001", title: "Valid " + extension.toUpperCase(), imageUrl },
+    ], { companionMetadataIncluded: true }));
+    const runtime = createRuntime({
+      directory,
+      fetch: async (url) => {
+        url = String(url);
+        runtime.calls.push({ url });
+        if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 5 });
+        if (url === imageUrl)
+          return new Response(new Blob([bytes]), { status: 200, headers: { "content-type": contentType } });
+        throw new Error("Unexpected fetch: " + url);
+      },
+    });
+    runtime.run();
+    runtime.element("suno-dl-mp3").checked = false;
+    runtime.element("suno-dl-cover").checked = true;
+    runtime.element("suno-dl-btn").click();
+    await waitFor(() => /^Done\./.test(runtime.status()), extension + " cover run did not finish", 3000);
+    assert.ok(directory.paths().some((name) => name.endsWith("Valid " + extension.toUpperCase() + "." + extension)));
+  });
+}
+
+for (const [label, bytes, contentType] of [
+  ["PNG without image chunks", new Uint8Array([
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+    0, 0, 0, 0, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+  ]), "image/png"],
+  ["WebP without a VP8 image chunk", new Uint8Array([
+    0x52, 0x49, 0x46, 0x46, 12, 0, 0, 0, 0x57, 0x45, 0x42, 0x50,
+    0x4a, 0x55, 0x4e, 0x4b, 0, 0, 0, 0,
+  ]), "image/webp"],
+]) {
+  test(label + " is rejected despite plausible container markers", async () => {
+    const imageUrl = "https://img.example/malformed-structure";
+    const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+      { id: "badstructure1", title: label, imageUrl },
+    ], { companionMetadataIncluded: true }));
+    const runtime = createRuntime({
+      directory,
+      fetch: async (url) => {
+        url = String(url);
+        runtime.calls.push({ url });
+        if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 5 });
+        if (url === imageUrl)
+          return new Response(new Blob([bytes]), { status: 200, headers: { "content-type": contentType } });
+        throw new Error("Unexpected fetch: " + url);
+      },
+    });
+    runtime.run();
+    runtime.element("suno-dl-mp3").checked = false;
+    runtime.element("suno-dl-cover").checked = true;
+    runtime.element("suno-dl-btn").click();
+    await waitFor(() => /^Done\./.test(runtime.status()), label + " run did not finish", 3000);
+    assert.match(runtime.status(), /0 downloaded, 0 skipped, 1 failed/);
+  });
+}
+
+test("flat browser companion names use the stable clip suffix", async () => {
+  const runtime = createRuntime({
+    usePicker: false,
+    libraryClips: [{
+      id: "flatcomp001", title: "Flat companion", status: "complete",
+      metadata: { tags: "flat style", prompt: "flat lyrics" },
+    }],
+  });
+  runtime.run();
+  runtime.element("suno-dl-mp3").checked = false;
+  runtime.element("suno-dl-info").checked = true;
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "flat companion run did not finish", 3000);
+  assert.deepEqual(runtime.document.downloads, ["Flat companion [flatcomp].txt"]);
+});
+
+test("existing song info and cover files are preserved without a cover request", async () => {
+  const imageUrl = "https://img.example/must-not-fetch.jpg";
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "preserve001", title: "Preserve", imageUrl },
+  ], { companionMetadataIncluded: true }));
+  const songDir = new MemoryDirectory("Preserve [preserve]")
+    .seed("Preserve.txt", "user-maintained notes")
+    .seed("Preserve.png", new Blob([JPEG_BYTES]));
+  directory.directories.set("Preserve [preserve]", songDir);
+  const runtime = createRuntime({ directory });
+  runtime.run();
+  runtime.element("suno-dl-mp3").checked = false;
+  runtime.element("suno-dl-info").checked = true;
+  runtime.element("suno-dl-cover").checked = true;
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "existing companions run did not finish", 3000);
+  assert.match(runtime.status(), /0 downloaded, 1 skipped, 0 failed/);
+  assert.equal(await songDir.files.get("Preserve.txt").getFile().then((file) => file.text()), "user-maintained notes");
+  assert.equal(runtime.calls.some((call) => call.url === imageUrl), false);
+});
+
+test("a failed large cover URL falls back to the feed's smaller existing image", async () => {
+  const large = "https://img.example/missing-large.jpg";
+  const small = "https://img.example/working-small.jpg";
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "coverfallback", title: "Cover fallback", imageUrl: large, imageFallbackUrl: small },
+  ], { companionMetadataIncluded: true }));
+  const runtime = createRuntime({
+    directory,
+    fetch: async (url) => {
+      url = String(url);
+      runtime.calls.push({ url });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 5 });
+      if (url === large) return new Response("missing", { status: 404 });
+      if (url === small)
+        return new Response(new Blob([JPEG_BYTES]), { status: 200, headers: { "content-type": "image/jpeg" } });
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-mp3").checked = false;
+  runtime.element("suno-dl-cover").checked = true;
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "cover fallback run did not finish", 3000);
+  assert.ok(directory.paths().some((name) => name.endsWith("Cover fallback.jpg")));
+  assert.equal(runtime.calls.filter((call) => call.url === large).length, 1);
+  assert.equal(runtime.calls.filter((call) => call.url === small).length, 1);
+});
+
+test("a companion-only positive LIMIT stops requesting later feed pages", async () => {
+  const directory = new MemoryDirectory();
+  let libraryPages = 0;
+  const runtime = createRuntime({
+    directory,
+    script: SCRIPT
+      .replace("const LIMIT = 0", "const LIMIT = 1")
+      .replace("const INCLUDE_WORKSPACE = true", "const INCLUDE_WORKSPACE = false"),
+    fetch: async (url) => {
+      url = String(url);
+      runtime.calls.push({ url });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 5 });
+      if (url.endsWith("/api/feed/v3")) {
+        libraryPages++;
+        if (libraryPages > 1) throw new Error("companion LIMIT requested an unnecessary page");
+        return jsonResponse({ clips: [{
+          id: "compLimit001", title: "Companion limited", status: "complete",
+          metadata: { tags: "limited style" },
+        }], next_cursor: "unread-page" });
+      }
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-mp3").checked = false;
+  runtime.element("suno-dl-info").checked = true;
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "companion limit run did not finish", 3000);
+  assert.equal(libraryPages, 1);
+  assert.ok(directory.paths().some((name) => name.endsWith("Companion limited.txt")));
+});
+
+test("a cover-only positive LIMIT skips coverless songs before stopping pagination", async () => {
+  const imageUrl = "https://img.example/limited-cover.jpg";
+  const directory = new MemoryDirectory();
+  let libraryPages = 0;
+  const runtime = createRuntime({
+    directory,
+    script: SCRIPT
+      .replace("const LIMIT = 0", "const LIMIT = 1")
+      .replace("const INCLUDE_WORKSPACE = true", "const INCLUDE_WORKSPACE = false"),
+    fetch: async (url) => {
+      url = String(url);
+      runtime.calls.push({ url });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 5 });
+      if (url.endsWith("/api/feed/v3")) {
+        libraryPages++;
+        if (libraryPages === 1) return jsonResponse({ clips: [{
+          id: "coverless001", title: "No artwork", status: "complete", metadata: {},
+        }], next_cursor: "after-coverless" });
+        if (libraryPages === 2) return jsonResponse({ clips: [{
+          id: "covered0001", title: "Has artwork", status: "complete", image_url: imageUrl, metadata: {},
+        }], next_cursor: "unread-page" });
+        throw new Error("cover LIMIT requested an unnecessary page");
+      }
+      if (url === imageUrl)
+        return new Response(new Blob([JPEG_BYTES]), { status: 200, headers: { "content-type": "image/jpeg" } });
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-mp3").checked = false;
+  runtime.element("suno-dl-cover").checked = true;
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "cover-only limit run did not finish", 3000);
+  assert.equal(libraryPages, 2);
+  assert.ok(directory.paths().some((name) => name.endsWith("Has artwork.jpg")));
+  assert.equal(directory.paths().some((name) => name.includes("No artwork")), false);
+});
+
+test("a limited manual companion migration does not retain unrefreshed legacy entries", async () => {
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "oldlegacy001", title: "Unrefreshed legacy" },
+  ]));
+  const runtime = createRuntime({
+    directory,
+    script: SCRIPT
+      .replace("const LIMIT = 0", "const LIMIT = 1")
+      .replace("const INCLUDE_WORKSPACE = true", "const INCLUDE_WORKSPACE = false"),
+    fetch: async (url) => {
+      url = String(url);
+      runtime.calls.push({ url });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 5 });
+      if (url.endsWith("/api/feed/v3")) return jsonResponse({ clips: [{
+        id: "newlegacy001", title: "Fresh metadata", status: "complete",
+        metadata: { tags: "fresh style", prompt: "fresh lyrics" },
+      }], next_cursor: "resume-legacy-migration" });
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-info").checked = true;
+  runtime.document.walk().find((element) => element.textContent === "Re-scan for new songs").click();
+  await waitFor(() => /Re-scan complete/.test(runtime.status()), "limited legacy re-scan did not finish", 3000);
+  const cache = JSON.parse(await directory.files.get("suno-cache.json").getFile().then((file) => file.text()));
+  assert.equal(cache.companionMetadataIncluded, true);
+  assert.deepEqual(cache.songs.map((song) => song.id), ["newlegacy001"]);
+  assert.equal(cache.libDone, false);
+  assert.equal(cache.libCursor, "resume-legacy-migration");
 });
 
 (async () => {

@@ -6,6 +6,8 @@ Download your completed Suno clips as MP3, WAV, and MIDI with one paste into the
 
 - **Downloads completed clips from your Suno library + workspace** (auto-detected via Suno's own feeds)
 - **MP3 and/or WAV and/or MIDI** — tick whichever you want (missing WAV files and MIDI data may require Suno's converters, so they're slower per song)
+- **Song info companions** — optionally save a UTF-8 `.txt` beside each song with available styles/genre tags, description prompt, lyrics, creator, creation time, model, duration, and instrumental status
+- **Cover artwork** — optionally save each song's existing JPEG, PNG, or WebP cover after validating the downloaded image bytes
 - **Stems support** — optionally download your already-generated stems as MP3s into each song's `stems/` folder (`Vocals.mp3`, `Drums.mp3`, ...), regardless of the full-song format selection; repeated names get stable clip-ID suffixes as needed so none overwrite each other or change names on later re-scans
 - **Section-edit clips grouped** — Suno's "replace section" variations (e.g. `[01:55.0 - 02:18.4] {verse]`) are available as existing MP3s and filed under their parent song's `variations/` folder; WAV/MIDI-only selections skip them
 - **Per-song folders** — one unique folder per song (`<title> [<id>]/`), so duplicate titles never collide; unsafe or overlong filename characters are normalized for portability (with the Chrome/Edge folder picker)
@@ -34,6 +36,8 @@ Download your completed Suno clips as MP3, WAV, and MIDI with one paste into the
    - **WAV** — downloads an existing WAV directly; if none exists, Suno may need to convert it first
    - **MIDI** — Suno converts each song to note data (typically the slowest format). **May use account credits.**
    - **Include stems** — also downloads your existing stems (only if you have them). Stems must have been generated in Suno first (click "Get stems" on a song in Suno, which costs credits) — this tool only *downloads* stems that already exist, it never generates them.
+   - **Song info** — saves the metadata Suno's feed currently provides as `<title>.txt`. Fields that Suno did not provide are simply omitted.
+   - **Cover image** — downloads the existing cover as `<title>.jpg`, `<title>.png`, or `<title>.webp`, based on its validated file signature.
 
 > **Conversion warning:** MIDI conversion may use account credits. For WAV, the downloader first checks for an existing file and downloads it directly; only a missing WAV triggers a conversion request. Suno's general WAV billing policy is not assumed here, so compare the displayed credit balance before and after a bounded run if that matters to you. This downloader never generates songs or stems.
 
@@ -41,7 +45,7 @@ Download your completed Suno clips as MP3, WAV, and MIDI with one paste into the
 
 9. Click **Start**.
 
-> Chrome or Edge is required for the folder picker, per-song folders, cache, and automatic resume/skip behavior. On Firefox/Safari it falls back to normal per-file downloads with stable clip-ID suffixes. Reruns cannot inspect or skip prior downloads, so the browser controls any repeat-download suffixes.
+> Chrome or Edge is required for the folder picker, per-song folders, cache, and automatic resume/skip behavior. On Firefox/Safari it falls back to normal per-file downloads with stable clip-ID suffixes, including companion files. Reruns cannot inspect or skip prior downloads, so the browser controls any repeat-download suffixes.
 
 ## What you get
 
@@ -51,6 +55,8 @@ Download your completed Suno clips as MP3, WAV, and MIDI with one paste into the
     My Song.mp3
     My Song.wav
     My Song.mid
+    My Song.txt
+    My Song.jpg
     stems/
       Vocals [a1b2c3d4].mp3
       Vocals [f6e7d8c9].mp3       (when the same stem was generated more than once)
@@ -67,6 +73,8 @@ Download your completed Suno clips as MP3, WAV, and MIDI with one paste into the
 ## Resuming and re-scanning
 
 - **Rerun to resume** — the script skips each already-downloaded format file, so a stopped run continues with missing files and newly selected formats.
+- **Existing companions are preserved** — nonempty `.txt` and cover files are skipped, just like existing audio files. A file-probe permission or I/O error stops safely instead of risking an overwrite.
+- **Older caches remain compatible** — selecting song info or covers with a cache created before companion metadata existed triggers one full feed re-scan so the files are not silently created from incomplete cached records.
 - **Re-scan for new songs** — if you've created songs since your last scan, click the "Re-scan for new songs" link. Suno's feeds are treated as newest-first, so the downloader stops after a full page of clips it has already seen. Delete `suno-cache.json` before rerunning if you need a guaranteed full rebuild instead of this fast incremental scan.
 - **Cache errors are not hidden** — if `suno-cache.json` is unreadable or malformed, the panel reports the problem instead of silently replacing resume state.
 

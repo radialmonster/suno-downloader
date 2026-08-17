@@ -10,6 +10,8 @@
  *       <title>.mp3            MP3 download
  *       <title>.wav            WAV download
  *       <title>.mid            MIDI download
+ *       <title>.txt            optional styles/prompt/lyrics and song details
+ *       <title>.<jpg|png|webp> optional existing cover image
  *       stems/                 (when stems enabled) Vocals.mp3, Drums.mp3, ...
  *       variations/            section-edit clips
  *     suno-cache.json          scan cache (auto-created)
@@ -58,6 +60,8 @@ void (async () => {
   const INCLUDE_LIBRARY = true; // your Suno library (created + liked songs)
   const INCLUDE_WORKSPACE = true; // completed clips returned by your workspace feed
   const INCLUDE_STEMS = false; // default checkbox preset for already-generated stems (no credits needed)
+  const INCLUDE_INFO = false; // default checkbox preset for lyrics/styles/prompt text companions
+  const INCLUDE_COVER = false; // default checkbox preset for existing song cover images
   const PAUSE_MS = 1500; // delay between songs (be polite to the API)
   const MAX_SCAN_PAGES = 10000; // final backstop for a broken endlessly-paginated API
 
@@ -146,6 +150,12 @@ void (async () => {
     <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer">
       <input type="checkbox" id="suno-dl-stems"> Include stems (already-generated ones, free)
     </label>
+    <label style="display:flex;align-items:center;gap:8px;margin-bottom:6px;cursor:pointer">
+      <input type="checkbox" id="suno-dl-info"> Song info (.txt: styles, prompt, lyrics)
+    </label>
+    <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer">
+      <input type="checkbox" id="suno-dl-cover"> Cover image
+    </label>
     <div id="suno-dl-credits" style="margin-bottom:8px;padding:8px;border-radius:6px;background:#262626;font-size:12px;white-space:pre-wrap"></div>
     <button id="suno-dl-pick" style="width:100%;padding:8px;margin-bottom:6px;border:0;border-radius:6px;background:#444;color:#fff;font-weight:600;cursor:pointer">Choose folder...</button>
     <button id="suno-dl-btn" style="width:100%;padding:8px;border:0;border-radius:6px;background:#ff6b9d;color:#fff;font-weight:600;cursor:pointer">Start</button>
@@ -158,13 +168,20 @@ void (async () => {
   const wavCheck = panel.querySelector("#suno-dl-wav");
   const midiCheck = panel.querySelector("#suno-dl-midi");
   const stemsCheck = panel.querySelector("#suno-dl-stems");
+  const infoCheck = panel.querySelector("#suno-dl-info");
+  const coverCheck = panel.querySelector("#suno-dl-cover");
   const creditsBox = panel.querySelector("#suno-dl-credits");
   const setStatus = (t) => { if (!destroyed) status.textContent = t; };
   let operationOptions = null;
   const includeStems = () => operationOptions ? operationOptions.includeStems : stemsCheck.checked;
+  const includeInfo = () => operationOptions ? operationOptions.includeInfo : infoCheck.checked;
+  const includeCover = () => operationOptions ? operationOptions.includeCover : coverCheck.checked;
+  const includeCompanions = () => includeInfo() || includeCover();
   mp3Check.checked = FORMAT === "mp3" || FORMAT === "both";
   wavCheck.checked = FORMAT === "wav" || FORMAT === "both";
   stemsCheck.checked = INCLUDE_STEMS;
+  infoCheck.checked = INCLUDE_INFO;
+  coverCheck.checked = INCLUDE_COVER;
   const getFormats = () => ({
     mp3: mp3Check.checked,
     wav: wavCheck.checked,
@@ -176,7 +193,8 @@ void (async () => {
     // Section-edit variations only have an existing MP3 to download. Do not let
     // one satisfy a WAV/MIDI-only LIMIT when download() would produce no file.
     if (entry.isInfill) return fmt.mp3;
-    return fmt.mp3 || fmt.wav || fmt.midi;
+    return fmt.mp3 || fmt.wav || fmt.midi || !!operationOptions?.includeInfo ||
+      (!!operationOptions?.includeCover && !!entry.imageUrl);
   };
   const instance = {
     async destroy() {
@@ -391,10 +409,39 @@ void (async () => {
     return null;
   };
 
+  const nonemptyString = (value) => typeof value === "string" && value.trim() ? value : undefined;
+  const httpsUrl = (value) => {
+    if (typeof value !== "string" || !value.trim()) return undefined;
+    try {
+      const parsed = new URL(value);
+      return parsed.protocol === "https:" ? parsed.href : undefined;
+    } catch { return undefined; }
+  };
+
   const toEntry = (c, sourceFeed) => {
     const e = { id: c.id, title: String(c.title || "untitled").trim(), sourceFeed };
+    const m = c.metadata || {};
+    const largeImageUrl = httpsUrl(c.image_large_url);
+    const smallImageUrl = httpsUrl(c.image_url);
     const audioUrl = clipAudioUrl(c);
     if (audioUrl) e.audioUrl = audioUrl;
+    const companionFields = {
+      styles: nonemptyString(m.tags),
+      lyrics: nonemptyString(m.prompt),
+      prompt: nonemptyString(m.gpt_description_prompt),
+      imageUrl: largeImageUrl || smallImageUrl,
+      imageFallbackUrl: largeImageUrl && smallImageUrl && largeImageUrl !== smallImageUrl ? smallImageUrl : undefined,
+      createdAt: nonemptyString(c.created_at),
+      modelName: nonemptyString(c.model_name),
+      modelVersion: nonemptyString(c.major_model_version),
+      creatorName: nonemptyString(c.display_name),
+      creatorHandle: nonemptyString(c.handle),
+      duration: Number.isFinite(m.duration) && m.duration >= 0 ? m.duration : undefined,
+      instrumental: typeof m.make_instrumental === "boolean" ? m.make_instrumental : undefined,
+    };
+    for (const [key, value] of Object.entries(companionFields)) {
+      if (value !== undefined) e[key] = value;
+    }
     if (isStem(c)) {
       e.isStem = true;
       e.parentId = stemParentId(c);
@@ -419,6 +466,7 @@ void (async () => {
     libDone: !INCLUDE_LIBRARY,
     wsDone: !INCLUDE_WORKSPACE,
     stemsIncluded: false,
+    companionMetadataIncluded: true,
     scanned: 0,
   };
   // Manual re-scans seed the map from the existing cache. Those old entries do
@@ -435,10 +483,23 @@ void (async () => {
   // fixed source priority rather than response timing, and persist the source
   // so partial-cache resumes make the same decision.
   const sourcePriority = (source) => source === "library" ? 2 : source === "workspace" ? 1 : 0;
+  const companionFieldNames = ["styles", "lyrics", "prompt", "imageUrl", "imageFallbackUrl", "createdAt", "modelName",
+    "modelVersion", "creatorName", "creatorHandle", "duration", "instrumental"];
   const upsertScanEntry = (clip, sourceFeed) => {
     const entry = toEntry(clip, sourceFeed);
     const previous = scanState.songs.get(clip.id);
-    if (previous && sourcePriority(previous.sourceFeed) > sourcePriority(sourceFeed)) return;
+    if (previous && sourcePriority(previous.sourceFeed) > sourcePriority(sourceFeed)) {
+      for (const field of companionFieldNames) {
+        if (previous[field] === undefined && entry[field] !== undefined) previous[field] = entry[field];
+      }
+      return;
+    }
+    // A lower-priority feed or an older cache may contain a companion value
+    // omitted by the preferred record. Preserve only missing values; populated
+    // fields still follow deterministic library-over-workspace priority.
+    for (const field of companionFieldNames) {
+      if (entry[field] === undefined && previous?.[field] !== undefined) entry[field] = previous[field];
+    }
     if (entry.isStem && previous?.stemOutputBase) entry.stemOutputBase = previous.stemOutputBase;
     if (entry.isInfill && previous?.variationOutputBase) entry.variationOutputBase = previous.variationOutputBase;
     if ((entry.isStem || entry.isInfill) && previous?.orphanFolderOutputBase)
@@ -708,16 +769,108 @@ void (async () => {
 
   const validateMediaBlob = async (blob, contentType, kind, url) => {
     const mime = String(contentType || "").split(";", 1)[0].trim().toLowerCase();
-    if (mime.startsWith("text/") || mime.startsWith("image/") || mime.startsWith("video/") ||
+    if (mime.startsWith("text/") || mime.startsWith("video/") ||
+        (kind !== "image" && mime.startsWith("image/")) ||
+        (kind === "image" && mime.startsWith("audio/")) ||
         mime === "application/json" || mime.endsWith("+json") ||
         mime === "application/xml" || mime.endsWith("+xml"))
-      throw new Error("unexpected " + (mime || "non-audio") + " response while fetching " + url);
+      throw new Error("unexpected " + (mime || "binary") + " response while fetching " + url);
 
     // CDNs sometimes serve media as application/octet-stream or omit the MIME
     // type, so validate the container bytes rather than requiring one exact
     // header. This also catches a binary error/image body returned with HTTP 200.
     const head = new Uint8Array(await blob.slice(0, Math.min(blob.size, 4096)).arrayBuffer());
-    if (kind === "wav") {
+    if (kind === "image") {
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const jpeg = bytes.length >= 4 && bytes[0] === 0xff && bytes[1] === 0xd8 &&
+        bytes[bytes.length - 2] === 0xff && bytes[bytes.length - 1] === 0xd9;
+      if (jpeg) {
+        let offset = 2;
+        let hasFrame = false;
+        let hasScan = false;
+        while (offset + 1 < bytes.length - 2) {
+          if (bytes[offset++] !== 0xff) break;
+          while (offset < bytes.length && bytes[offset] === 0xff) offset++;
+          const marker = bytes[offset++];
+          if (marker === 0xd9) break;
+          if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+          if (offset + 2 > bytes.length) break;
+          const size = view.getUint16(offset, false);
+          if (size < 2 || offset + size > bytes.length) break;
+          const isFrame = (marker >= 0xc0 && marker <= 0xcf &&
+            ![0xc4, 0xc8, 0xcc].includes(marker));
+          if (isFrame && size >= 8) {
+            const height = view.getUint16(offset + 3, false);
+            const width = view.getUint16(offset + 5, false);
+            hasFrame = height > 0 && width > 0 && bytes[offset + 7] > 0;
+          }
+          if (marker === 0xda) {
+            hasScan = size >= 6 && offset + size < bytes.length - 2;
+            break;
+          }
+          offset += size;
+        }
+        if (hasFrame && hasScan) return "jpg";
+      }
+      const png = bytes.length >= 8 &&
+        bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47 &&
+        bytes[4] === 0x0d && bytes[5] === 0x0a && bytes[6] === 0x1a && bytes[7] === 0x0a;
+      if (png) {
+        let offset = 8;
+        let hasHeader = false;
+        let hasData = false;
+        let ended = false;
+        const pngCrc = (start, end) => {
+          let crc = 0xffffffff;
+          for (let i = start; i < end; i++) {
+            crc ^= bytes[i];
+            for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+          }
+          return (crc ^ 0xffffffff) >>> 0;
+        };
+        for (let chunks = 0; chunks < 10000 && offset + 12 <= bytes.length; chunks++) {
+          const size = view.getUint32(offset, false);
+          const type = String.fromCharCode(bytes[offset + 4], bytes[offset + 5], bytes[offset + 6], bytes[offset + 7]);
+          const end = offset + 12 + size;
+          if (end > bytes.length) break;
+          if (pngCrc(offset + 4, offset + 8 + size) !== view.getUint32(offset + 8 + size, false)) break;
+          if (chunks === 0 && type === "IHDR" && size === 13) {
+            hasHeader = view.getUint32(offset + 8, false) > 0 && view.getUint32(offset + 12, false) > 0;
+          }
+          if (type === "IDAT" && size > 0) hasData = true;
+          if (type === "IEND") {
+            ended = size === 0 && end === bytes.length;
+            break;
+          }
+          offset = end;
+        }
+        if (hasHeader && hasData && ended) return "png";
+      }
+      const webp = bytes.length >= 20 &&
+        bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 &&
+        bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50 &&
+        view.getUint32(4, true) + 8 === bytes.length;
+      if (webp) {
+        const type = String.fromCharCode(bytes[12], bytes[13], bytes[14], bytes[15]);
+        const size = view.getUint32(16, true);
+        const paddedEnd = 20 + size + (size & 1);
+        let dimensions = false;
+        if (paddedEnd <= bytes.length && type === "VP8 " && size >= 10)
+          dimensions = bytes[23] === 0x9d && bytes[24] === 0x01 && bytes[25] === 0x2a &&
+            (view.getUint16(26, true) & 0x3fff) > 0 && (view.getUint16(28, true) & 0x3fff) > 0;
+        else if (paddedEnd <= bytes.length && type === "VP8L" && size >= 5) {
+          const width = 1 + (bytes[21] | ((bytes[22] & 0x3f) << 8));
+          const height = 1 + ((bytes[22] >> 6) | (bytes[23] << 2) | ((bytes[24] & 0x0f) << 10));
+          dimensions = bytes[20] === 0x2f && width > 0 && height > 0 && ((bytes[24] >> 5) & 0x07) === 0;
+        }
+        else if (paddedEnd <= bytes.length && type === "VP8X" && size >= 10)
+          dimensions = (bytes[24] | (bytes[25] << 8) | (bytes[26] << 16)) < 0xffffff &&
+            (bytes[27] | (bytes[28] << 8) | (bytes[29] << 16)) < 0xffffff;
+        if (dimensions) return "webp";
+      }
+      throw new Error("response is not a complete supported cover image while fetching " + url);
+    } else if (kind === "wav") {
       let container = head.length >= 12 &&
         head[0] === 0x52 && head[1] === 0x49 && head[2] === 0x46 && head[3] === 0x46 && // RIFF
         head[8] === 0x57 && head[9] === 0x41 && head[10] === 0x56 && head[11] === 0x45; // WAVE
@@ -856,7 +1009,11 @@ void (async () => {
           throw error;
         }
         try {
-          await validateMediaBlob(blob, contentType, kind, url);
+          const validation = await validateMediaBlob(blob, contentType, kind, url);
+          if (kind === "image") {
+            if (destroyed || stopRequested || signal.aborted) throw new Error("download stopped");
+            return { blob, extension: validation };
+          }
         } catch (error) {
           error.retryable = false;
           throw error;
@@ -900,6 +1057,22 @@ void (async () => {
           "; legacy CDN fallback failed: " + (fallbackError?.message || fallbackError));
       }
     }
+  }
+
+  function songInfoText(entry) {
+    const lines = ["Title: " + entry.title, "Suno clip ID: " + entry.id];
+    if (entry.sourceFeed) lines.push("Source feed: " + entry.sourceFeed);
+    if (entry.creatorName) lines.push("Creator: " + entry.creatorName);
+    if (entry.creatorHandle) lines.push("Creator handle: @" + entry.creatorHandle.replace(/^@/, ""));
+    if (entry.createdAt) lines.push("Created: " + entry.createdAt);
+    if (entry.modelName) lines.push("Model: " + entry.modelName);
+    if (entry.modelVersion) lines.push("Model version: " + entry.modelVersion);
+    if (entry.duration !== undefined) lines.push("Duration: " + entry.duration + " seconds");
+    if (entry.instrumental !== undefined) lines.push("Instrumental: " + (entry.instrumental ? "yes" : "no"));
+    if (entry.styles) lines.push("", "Styles / genre:", entry.styles);
+    if (entry.prompt) lines.push("", "Description prompt:", entry.prompt);
+    if (entry.lyrics) lines.push("", "Lyrics:", entry.lyrics);
+    return lines.join("\n") + "\n";
   }
 
   const parseWavStatus = (r) => {
@@ -1351,6 +1524,46 @@ void (async () => {
         } catch (e) { fail("midi", e); }
       }
     };
+    const saveInfo = async (d, name) => {
+      const filename = name + ".txt";
+      if (d && await existsInFolder(d, filename)) out.files.push("info:skip");
+      else {
+        try {
+          const blob = new Blob([songInfoText(entry)], { type: "text/plain;charset=utf-8" });
+          if (d) await saveToFolder(d, filename, blob);
+          else saveViaDownload(filename, blob);
+          out.files.push("info");
+        } catch (e) { fail("info", e); }
+      }
+    };
+    const saveCover = async (d, name) => {
+      if (!entry.imageUrl) { out.files.push("cover:skip"); return; }
+      try {
+        if (d) {
+          for (const extension of ["jpg", "png", "webp"]) {
+            if (await existsInFolder(d, name + "." + extension)) {
+              out.files.push("cover:skip");
+              return;
+            }
+          }
+        }
+        const urls = [...new Set([entry.imageUrl, entry.imageFallbackUrl].filter(Boolean))];
+        let image;
+        let lastError;
+        for (const url of urls) {
+          try { image = await fetchBlob(url, "image"); break; }
+          catch (error) {
+            lastError = error;
+            if (operationCancelled()) throw error;
+          }
+        }
+        if (!image) throw lastError || new Error("no cover image URL was available");
+        const filename = name + "." + image.extension;
+        if (d) await saveToFolder(d, filename, image.blob);
+        else saveViaDownload(filename, image.blob);
+        out.files.push("cover");
+      } catch (e) { fail("cover", e); }
+    };
     if (isStem) {
       const parentEntry = scanState.songs.get(parentId);
       const fname = stemFileBase(entry);
@@ -1420,6 +1633,8 @@ void (async () => {
       } else await saveWav(songDir, clean);
     }
     if (fmt.midi) await saveMidi(songDir, dir ? clean : fallbackBase);
+    if (operationOptions?.includeInfo) await saveInfo(songDir, dir ? clean : fallbackBase);
+    if (operationOptions?.includeCover) await saveCover(songDir, dir ? clean : fallbackBase);
     return out;
   }
 
@@ -1444,6 +1659,8 @@ void (async () => {
         throw new Error("cache wsDone field is not a boolean");
       if (cached.stemsIncluded !== undefined && typeof cached.stemsIncluded !== "boolean")
         throw new Error("cache stemsIncluded field is not a boolean");
+      if (cached.companionMetadataIncluded !== undefined && typeof cached.companionMetadataIncluded !== "boolean")
+        throw new Error("cache companionMetadataIncluded field is not a boolean");
       if (cached.libCursor !== undefined && !validCursor(cached.libCursor))
         throw new Error("cache libCursor field is invalid");
       if (cached.wsCursor !== undefined && !validCursor(cached.wsCursor))
@@ -1487,6 +1704,24 @@ void (async () => {
           throw new Error("cache contains an invalid stem name");
         if (song.sourceFeed !== undefined && !["library", "workspace"].includes(song.sourceFeed))
           throw new Error("cache contains an invalid source feed");
+        for (const field of ["styles", "lyrics", "prompt", "createdAt", "modelName", "modelVersion",
+          "creatorName", "creatorHandle"]) {
+          if (song[field] !== undefined && typeof song[field] !== "string")
+            throw new Error("cache contains an invalid song " + field);
+        }
+        for (const field of ["imageUrl", "imageFallbackUrl"]) {
+          if (song[field] === undefined) continue;
+          if (typeof song[field] !== "string")
+            throw new Error("cache contains an invalid song image URL");
+          let parsedImageUrl;
+          try { parsedImageUrl = new URL(song[field]); } catch {}
+          if (parsedImageUrl?.protocol !== "https:")
+            throw new Error("cache contains an unsafe song image URL");
+        }
+        if (song.duration !== undefined && (!Number.isFinite(song.duration) || song.duration < 0))
+          throw new Error("cache contains an invalid song duration");
+        if (song.instrumental !== undefined && typeof song.instrumental !== "boolean")
+          throw new Error("cache contains an invalid song instrumental flag");
       }
       if (new Set(cached.songs.map((song) => song.id)).size !== cached.songs.length)
         throw new Error("cache contains duplicate song IDs");
@@ -1530,6 +1765,7 @@ void (async () => {
       libDone: scanState.libDone,
       wsDone: scanState.wsDone,
       stemsIncluded: scanState.stemsIncluded,
+      companionMetadataIncluded: scanState.companionMetadataIncluded,
       includeLibrary: INCLUDE_LIBRARY,
       includeWorkspace: INCLUDE_WORKSPACE,
       songs: [...scanState.songs.values()],
@@ -1569,6 +1805,7 @@ void (async () => {
     scanState.stemsIncluded = typeof cached.stemsIncluded === "boolean"
       ? cached.stemsIncluded
       : (cached.songs || []).some((s) => s.isStem);
+    scanState.companionMetadataIncluded = cached.companionMetadataIncluded === true;
     scanState.scanned = cached.scanned || 0;
     scanLimitBaselineIds = new Set(cached.rescanBaselineIds || []);
   }
@@ -1581,6 +1818,7 @@ void (async () => {
     scanState.libDone = !INCLUDE_LIBRARY;
     scanState.wsDone = !INCLUDE_WORKSPACE;
     scanState.stemsIncluded = false;
+    scanState.companionMetadataIncluded = true;
     scanState.scanned = 0;
     scanLimitBaselineIds = new Set();
   }
@@ -1646,6 +1884,8 @@ void (async () => {
   const eligibilityKey = () => JSON.stringify({
     formats: operationOptions?.formats || getFormats(),
     includeStems: includeStems(),
+    includeInfo: includeInfo(),
+    includeCover: includeCover(),
   });
 
   async function ensureSongs(dir) {
@@ -1662,12 +1902,13 @@ void (async () => {
       ? cached.stemsIncluded
       : (cached.songs || []).some((s) => s.isStem));
     const needStemRescan = cached && includeStems() && !cacheIncludedStems;
+    const needCompanionRescan = cached && includeCompanions() && cached.companionMetadataIncluded !== true;
     const needFeedRescan = cached && !cacheMatchesFeedSelection(cached);
     const cachedBaselineIds = new Set(cached?.rescanBaselineIds || []);
     const cachedEligibleCount = cached ? cached.songs.filter((entry) =>
       !cachedBaselineIds.has(entry.id) && isDownloadable(entry)).length : 0;
     const cacheSatisfiesLimit = LIMIT > 0 && cachedEligibleCount >= LIMIT;
-    if (cached && !rescan && !needStemRescan && !needFeedRescan &&
+    if (cached && !rescan && !needStemRescan && !needCompanionRescan && !needFeedRescan &&
         ((cached.libDone && cached.wsDone) || cacheSatisfiesLimit)) {
       restoreScanState(cached);
       const orderChanged = orderScanEntries();
@@ -1692,15 +1933,17 @@ void (async () => {
     earlyStopWorkspace = false;
     if (cached && !needFeedRescan) restoreScanState(cached);
     else resetScanState();
-    if (needStemRescan && !needFeedRescan) {
-      // force a full re-walk so stems get collected (done flags from cache would skip it)
+    if ((needStemRescan || needCompanionRescan) && !needFeedRescan) {
+      // Force a full re-walk so a legacy cache gains the requested capability;
+      // its completed cursors would otherwise skip every feed page.
       scanState.songs = new Map();
       scanState.seenIds = new Set();
       scanState.libCursor = null;
       scanState.wsCursor = null;
       scanState.libDone = !INCLUDE_LIBRARY;
       scanState.wsDone = !INCLUDE_WORKSPACE;
-      scanState.stemsIncluded = true;
+      scanState.stemsIncluded = includeStems();
+      scanState.companionMetadataIncluded = true;
       scanLimitBaselineIds = new Set();
     }
     const { songs: fresh } = await enumerateSongs(dir);
@@ -1734,7 +1977,7 @@ void (async () => {
     startBtn.disabled = isBusy;
     stopBtn.disabled = !canStop;
     pickBtn.disabled = isBusy || !usePicker;
-    for (const cb of [mp3Check, wavCheck, midiCheck, stemsCheck]) cb.disabled = isBusy;
+    for (const cb of [mp3Check, wavCheck, midiCheck, stemsCheck, infoCheck, coverCheck]) cb.disabled = isBusy;
     if (rescanLink) {
       rescanLink.setAttribute("aria-disabled", String(isBusy));
       rescanLink.style.pointerEvents = isBusy ? "none" : "auto";
@@ -1772,10 +2015,13 @@ void (async () => {
     operationOptions = {
       formats: getFormats(),
       includeStems: stemsCheck.checked,
+      includeInfo: infoCheck.checked,
+      includeCover: coverCheck.checked,
       creditApproved: false,
     };
     if (!operationOptions.formats.mp3 && !operationOptions.formats.wav &&
-        !operationOptions.formats.midi && !operationOptions.includeStems) {
+        !operationOptions.formats.midi && !operationOptions.includeStems &&
+        !operationOptions.includeInfo && !operationOptions.includeCover) {
       operationOptions = null;
       setStatus("Select at least one format before starting.");
       return;
@@ -1873,6 +2119,8 @@ void (async () => {
       operationOptions = {
         formats: getFormats(),
         includeStems: stemsCheck.checked,
+        includeInfo: infoCheck.checked,
+        includeCover: coverCheck.checked,
       };
       operationController = new AbortController();
       setBusy(true);
@@ -1890,20 +2138,27 @@ void (async () => {
         pickedDir = dir;
         const cached = await readCache(dir);
         const feedSelectionMatches = cacheMatchesFeedSelection(cached);
+        const upgradingLegacyCompanions = !!(cached && feedSelectionMatches &&
+          includeCompanions() && cached.companionMetadataIncluded !== true);
         resetScanState();
         scanState.stemsIncluded = !!(cached && feedSelectionMatches && (typeof cached.stemsIncluded === "boolean"
           ? cached.stemsIncluded
           : (cached.songs || []).some((s) => s.isStem)));
+        scanState.companionMetadataIncluded = !cached || !feedSelectionMatches ||
+          cached.companionMetadataIncluded === true || includeCompanions();
         // If this cache predates a stem-inclusive scan, walk every page once;
         // seenIds also contains excluded stems and is not a safe early boundary.
-        const canEarlyStop = scanState.stemsIncluded || !includeStems();
+        const cacheHasCompanions = cached?.companionMetadataIncluded === true;
+        const canEarlyStop = (scanState.stemsIncluded || !includeStems()) &&
+          (cacheHasCompanions || !includeCompanions());
         // A partial cache only proves that its already-seen newest pages are
         // known; older pages may never have been scanned. Apply the newest-first
         // early boundary separately, and only to feeds previously completed.
         earlyStopLibrary = feedSelectionMatches && canEarlyStop && cached?.libDone === true;
         earlyStopWorkspace = feedSelectionMatches && canEarlyStop && cached?.wsDone === true;
-        knownBeforeRescan = new Set(feedSelectionMatches ? (cached?.seenIds || []) : []);
-        if (cached && feedSelectionMatches && cached.songs) {
+        knownBeforeRescan = new Set(feedSelectionMatches && !upgradingLegacyCompanions
+          ? (cached?.seenIds || []) : []);
+        if (cached && feedSelectionMatches && !upgradingLegacyCompanions && cached.songs) {
           // seed from cache so the early-stop boundary knows what's already seen,
           // but keep done flags false so feeds actually re-walk
           for (const s of cached.songs) scanState.songs.set(s.id, s);
@@ -1952,7 +2207,7 @@ void (async () => {
     panel.appendChild(link);
   }
 
-  for (const cb of [mp3Check, wavCheck, midiCheck, stemsCheck]) {
+  for (const cb of [mp3Check, wavCheck, midiCheck, stemsCheck, infoCheck, coverCheck]) {
     cb.addEventListener("change", () => {
       trackTask(refreshCredits()).catch((err) => {
         if (!destroyed) creditsBox.textContent = "Could not read credit balance: " + (err?.message || err);
