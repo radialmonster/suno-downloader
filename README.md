@@ -6,7 +6,7 @@ Download your completed Suno clips as MP3, WAV, and MIDI with one paste into the
 
 - **Downloads completed clips from your Suno library + workspace** (auto-detected via Suno's own feeds)
 - **MP3 and/or WAV and/or MIDI** — tick whichever you want (missing WAV files and MIDI data may require Suno's converters, so they're slower per song)
-- **Song info companions** — optionally save a UTF-8 `.txt` beside each song with available styles/genre tags, description prompt, lyrics, creator, creation time, model, duration, and instrumental status
+- **Song info companions** — optionally save a UTF-8 `.txt` beside each song with available description/genre tags, lyrics, creator, creation time, model, duration, and instrumental status (plus a separate legacy description prompt when Suno provides one)
 - **Cover artwork** — optionally save each song's existing JPEG, PNG, or WebP cover after validating the downloaded image bytes
 - **Stems support** — optionally download your already-generated stems as MP3s into each song's `stems/` folder (`Vocals.mp3`, `Drums.mp3`, ...), regardless of the full-song format selection; repeated names get stable clip-ID suffixes as needed so none overwrite each other or change names on later re-scans
 - **Section-edit clips grouped** — Suno's "replace section" variations (e.g. `[01:55.0 - 02:18.4] {verse]`) are available as existing MP3s and filed under their parent song's `variations/` folder; WAV/MIDI-only selections skip them

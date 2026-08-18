@@ -151,7 +151,7 @@ void (async () => {
       <input type="checkbox" id="suno-dl-stems"> Include stems (already-generated ones, free)
     </label>
     <label style="display:flex;align-items:center;gap:8px;margin-bottom:6px;cursor:pointer">
-      <input type="checkbox" id="suno-dl-info"> Song info (.txt: styles, prompt, lyrics)
+      <input type="checkbox" id="suno-dl-info"> Song info (.txt: description/genre, lyrics)
     </label>
     <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer">
       <input type="checkbox" id="suno-dl-cover"> Cover image
@@ -1069,7 +1069,7 @@ void (async () => {
     if (entry.modelVersion) lines.push("Model version: " + entry.modelVersion);
     if (entry.duration !== undefined) lines.push("Duration: " + entry.duration + " seconds");
     if (entry.instrumental !== undefined) lines.push("Instrumental: " + (entry.instrumental ? "yes" : "no"));
-    if (entry.styles) lines.push("", "Styles / genre:", entry.styles);
+    if (entry.styles) lines.push("", "Description / genre:", entry.styles);
     if (entry.prompt) lines.push("", "Description prompt:", entry.prompt);
     if (entry.lyrics) lines.push("", "Lyrics:", entry.lyrics);
     return lines.join("\n") + "\n";

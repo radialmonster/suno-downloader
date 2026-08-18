@@ -3391,7 +3391,7 @@ test("a companion-only run saves UTF-8 song info and a validated cover without p
   assert.ok(songDir.files.has("Archive song.txt"));
   assert.ok(songDir.files.has("Archive song.jpg"));
   const info = await songDir.files.get("Archive song.txt").getFile().then((file) => file.text());
-  assert.match(info, /Styles \/ genre:\ndream pop, warm synths/);
+  assert.match(info, /Description \/ genre:\ndream pop, warm synths/);
   assert.match(info, /Description prompt:\nA hazy midnight pop song/);
   assert.match(info, /Lyrics:\n\[Verse\]\nUnicode lyric: café 雨/);
   assert.match(info, /Creator: Example Creator/);
