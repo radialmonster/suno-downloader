@@ -42,6 +42,22 @@ const MALFORMED_JPEG_BYTES = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0xff,
 const PNG_BYTES = new Uint8Array(Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"));
 const WEBP_BYTES = new Uint8Array(Buffer.from("UklGRhwAAABXRUJQVlA4TA8AAAAvAUAAAAcQ9Y/+ByKi/wEA", "base64"));
+const EXTENDED_WEBP_BYTES = (() => {
+  const bytes = new Uint8Array(30 + WEBP_BYTES.length - 12);
+  bytes.set([0x52, 0x49, 0x46, 0x46], 0); // RIFF
+  new DataView(bytes.buffer).setUint32(4, bytes.length - 8, true);
+  bytes.set([0x57, 0x45, 0x42, 0x50], 8); // WEBP
+  bytes.set([0x56, 0x50, 0x38, 0x58, 10, 0, 0, 0], 12); // VP8X, 10-byte header
+  bytes[24] = 1; // canvas width minus one: 2 px
+  bytes[27] = 1; // canvas height minus one: 2 px
+  bytes.set(WEBP_BYTES.slice(12), 30);
+  return bytes;
+})();
+const VP8X_ONLY_WEBP_BYTES = (() => {
+  const bytes = EXTENDED_WEBP_BYTES.slice(0, 30);
+  new DataView(bytes.buffer).setUint32(4, bytes.length - 8, true);
+  return bytes;
+})();
 async function waitFor(predicate, message, timeoutMs = 1500) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -3492,6 +3508,59 @@ test("an invalid cover body is rejected and never saved as an image", async () =
   assert.equal(directory.paths().some((name) => /Bad cover\.(?:jpg|png|webp)$/.test(name)), false);
 });
 
+test("encoded cover media does not compare decoded bytes with encoded Content-Length", async () => {
+  const imageUrl = "https://img.example/encoded-cover.jpg";
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "encodedcover", title: "Encoded cover", imageUrl },
+  ], { companionMetadataIncluded: true }));
+  const runtime = createRuntime({
+    directory,
+    fetch: async (url) => {
+      url = String(url);
+      runtime.calls.push({ url });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 5 });
+      if (url === imageUrl) return new Response(new Blob([JPEG_BYTES]), {
+        status: 200,
+        headers: { "content-type": "image/jpeg", "content-encoding": "gzip", "content-length": "1" },
+      });
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-mp3").checked = false;
+  runtime.element("suno-dl-cover").checked = true;
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "encoded cover run did not finish", 3000);
+  assert.ok(directory.paths().some((name) => name.endsWith("Encoded cover.jpg")));
+});
+
+test("a cover response with unsolicited Content-Range is rejected", async () => {
+  const imageUrl = "https://img.example/partial-cover.jpg";
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "partialcover", title: "Partial cover", imageUrl },
+  ], { companionMetadataIncluded: true }));
+  const runtime = createRuntime({
+    directory,
+    fetch: async (url) => {
+      url = String(url);
+      runtime.calls.push({ url });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 5 });
+      if (url === imageUrl) return new Response(new Blob([JPEG_BYTES]), {
+        status: 200,
+        headers: { "content-type": "image/jpeg", "content-range": "bytes 0-9/100" },
+      });
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-mp3").checked = false;
+  runtime.element("suno-dl-cover").checked = true;
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "partial cover run did not finish", 3000);
+  assert.match(runtime.status(), /0 downloaded, 0 skipped, 1 failed/);
+  assert.equal(directory.paths().some((name) => /Partial cover\.(?:jpg|png|webp)$/.test(name)), false);
+});
+
 for (const [extension, bytes, contentType] of [
   ["png", PNG_BYTES, "image/png"],
   ["webp", WEBP_BYTES, "image/webp"],
@@ -3521,6 +3590,32 @@ for (const [extension, bytes, contentType] of [
   });
 }
 
+test("a valid extended WebP with a VP8X header and image payload is accepted", async () => {
+  const imageUrl = "https://img.example/valid-extended.webp";
+  const directory = new MemoryDirectory().seed("suno-cache.json", completeCache([
+    { id: "validvp8x001", title: "Valid extended WebP", imageUrl },
+  ], { companionMetadataIncluded: true }));
+  const runtime = createRuntime({
+    directory,
+    fetch: async (url) => {
+      url = String(url);
+      runtime.calls.push({ url });
+      if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 5 });
+      if (url === imageUrl)
+        return new Response(new Blob([EXTENDED_WEBP_BYTES]), {
+          status: 200, headers: { "content-type": "image/webp" },
+        });
+      throw new Error("Unexpected fetch: " + url);
+    },
+  });
+  runtime.run();
+  runtime.element("suno-dl-mp3").checked = false;
+  runtime.element("suno-dl-cover").checked = true;
+  runtime.element("suno-dl-btn").click();
+  await waitFor(() => /^Done\./.test(runtime.status()), "extended WebP run did not finish", 3000);
+  assert.ok(directory.paths().some((name) => name.endsWith("Valid extended WebP.webp")));
+});
+
 for (const [label, bytes, contentType] of [
   ["PNG without image chunks", new Uint8Array([
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
@@ -3530,6 +3625,7 @@ for (const [label, bytes, contentType] of [
     0x52, 0x49, 0x46, 0x46, 12, 0, 0, 0, 0x57, 0x45, 0x42, 0x50,
     0x4a, 0x55, 0x4e, 0x4b, 0, 0, 0, 0,
   ]), "image/webp"],
+  ["WebP with only a VP8X canvas header", VP8X_ONLY_WEBP_BYTES, "image/webp"],
 ]) {
   test(label + " is rejected despite plausible container markers", async () => {
     const imageUrl = "https://img.example/malformed-structure";
@@ -3620,6 +3716,54 @@ test("a failed large cover URL falls back to the feed's smaller existing image",
   assert.equal(runtime.calls.filter((call) => call.url === large).length, 1);
   assert.equal(runtime.calls.filter((call) => call.url === small).length, 1);
 });
+
+for (const delayedFeed of ["library", "workspace"]) {
+  test("duplicate feeds retain alternate cover fallback when " + delayedFeed + " resolves last", async () => {
+    const preferred = "https://img.example/stale-library.jpg";
+    const alternate = "https://img.example/working-workspace.jpg";
+    const directory = new MemoryDirectory();
+    const runtime = createRuntime({
+      directory,
+      fetch: async (url) => {
+        url = String(url);
+        runtime.calls.push({ url });
+        if (url.endsWith("/api/billing/credits")) return jsonResponse({ total_credits_left: 5 });
+        if (url.endsWith("/api/feed/v3")) {
+          if (delayedFeed === "library") await new Promise((resolve) => setTimeout(resolve, 5));
+          return jsonResponse({ clips: [{
+            id: "sharedcover1", title: "Library cover", status: "complete",
+            image_url: preferred, metadata: {},
+          }], next_cursor: null });
+        }
+        if (url.includes("/api/project/feed")) {
+          if (delayedFeed === "workspace") await new Promise((resolve) => setTimeout(resolve, 5));
+          return jsonResponse({ items: [{ type: "clip", clip: {
+            id: "sharedcover1", title: "Workspace cover", status: "complete",
+            image_url: alternate, metadata: {},
+          } }], next_cursor: null });
+        }
+        if (url === preferred) return new Response("missing", { status: 404 });
+        if (url === alternate)
+          return new Response(new Blob([JPEG_BYTES]), {
+            status: 200, headers: { "content-type": "image/jpeg" },
+          });
+        throw new Error("Unexpected fetch: " + url);
+      },
+    });
+    runtime.run();
+    runtime.element("suno-dl-mp3").checked = false;
+    runtime.element("suno-dl-cover").checked = true;
+    runtime.element("suno-dl-btn").click();
+    await waitFor(() => /^Done\./.test(runtime.status()), "duplicate cover fallback did not finish", 3000);
+    const cache = JSON.parse(await directory.files.get("suno-cache.json").getFile().then((file) => file.text()));
+    assert.equal(cache.songs[0].title, "Library cover");
+    assert.equal(cache.songs[0].imageUrl, preferred);
+    assert.equal(cache.songs[0].imageFallbackUrl, alternate);
+    assert.ok(directory.paths().some((name) => name.endsWith("Library cover.jpg")));
+    assert.equal(runtime.calls.filter((call) => call.url === preferred).length, 1);
+    assert.equal(runtime.calls.filter((call) => call.url === alternate).length, 1);
+  });
+}
 
 test("a companion-only positive LIMIT stops requesting later feed pages", async () => {
   const directory = new MemoryDirectory();

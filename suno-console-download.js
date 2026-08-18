@@ -485,10 +485,17 @@ void (async () => {
   const sourcePriority = (source) => source === "library" ? 2 : source === "workspace" ? 1 : 0;
   const companionFieldNames = ["styles", "lyrics", "prompt", "imageUrl", "imageFallbackUrl", "createdAt", "modelName",
     "modelVersion", "creatorName", "creatorHandle", "duration", "instrumental"];
+  const mergeImageUrls = (preferred, alternate) => {
+    if (!preferred.imageUrl && alternate?.imageUrl) preferred.imageUrl = alternate.imageUrl;
+    const fallback = [preferred.imageFallbackUrl, alternate?.imageUrl, alternate?.imageFallbackUrl]
+      .find((url) => url && url !== preferred.imageUrl);
+    if (fallback) preferred.imageFallbackUrl = fallback;
+  };
   const upsertScanEntry = (clip, sourceFeed) => {
     const entry = toEntry(clip, sourceFeed);
     const previous = scanState.songs.get(clip.id);
     if (previous && sourcePriority(previous.sourceFeed) > sourcePriority(sourceFeed)) {
+      mergeImageUrls(previous, entry);
       for (const field of companionFieldNames) {
         if (previous[field] === undefined && entry[field] !== undefined) previous[field] = entry[field];
       }
@@ -497,6 +504,7 @@ void (async () => {
     // A lower-priority feed or an older cache may contain a companion value
     // omitted by the preferred record. Preserve only missing values; populated
     // fields still follow deterministic library-over-workspace priority.
+    mergeImageUrls(entry, previous);
     for (const field of companionFieldNames) {
       if (entry[field] === undefined && previous?.[field] !== undefined) entry[field] = previous[field];
     }
@@ -852,22 +860,64 @@ void (async () => {
         bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50 &&
         view.getUint32(4, true) + 8 === bytes.length;
       if (webp) {
-        const type = String.fromCharCode(bytes[12], bytes[13], bytes[14], bytes[15]);
-        const size = view.getUint32(16, true);
-        const paddedEnd = 20 + size + (size & 1);
-        let dimensions = false;
-        if (paddedEnd <= bytes.length && type === "VP8 " && size >= 10)
-          dimensions = bytes[23] === 0x9d && bytes[24] === 0x01 && bytes[25] === 0x2a &&
-            (view.getUint16(26, true) & 0x3fff) > 0 && (view.getUint16(28, true) & 0x3fff) > 0;
-        else if (paddedEnd <= bytes.length && type === "VP8L" && size >= 5) {
-          const width = 1 + (bytes[21] | ((bytes[22] & 0x3f) << 8));
-          const height = 1 + ((bytes[22] >> 6) | (bytes[23] << 2) | ((bytes[24] & 0x0f) << 10));
-          dimensions = bytes[20] === 0x2f && width > 0 && height > 0 && ((bytes[24] >> 5) & 0x07) === 0;
+        const chunkType = (offset) => String.fromCharCode(
+          bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]);
+        const validVp8 = (start, size) => size >= 10 && start + size <= bytes.length &&
+          bytes[start + 3] === 0x9d && bytes[start + 4] === 0x01 && bytes[start + 5] === 0x2a &&
+          (view.getUint16(start + 6, true) & 0x3fff) > 0 &&
+          (view.getUint16(start + 8, true) & 0x3fff) > 0;
+        const validVp8l = (start, size) => {
+          if (size < 5 || start + size > bytes.length || bytes[start] !== 0x2f) return false;
+          const width = 1 + (bytes[start + 1] | ((bytes[start + 2] & 0x3f) << 8));
+          const height = 1 + ((bytes[start + 2] >> 6) | (bytes[start + 3] << 2) |
+            ((bytes[start + 4] & 0x0f) << 10));
+          return width > 0 && height > 0 && ((bytes[start + 4] >> 5) & 0x07) === 0;
+        };
+        const validFrameChunk = (type, start, size) =>
+          type === "VP8 " ? validVp8(start, size) : type === "VP8L" && validVp8l(start, size);
+        let offset = 12;
+        let validStructure = true;
+        let hasImagePayload = false;
+        for (let chunks = 0; chunks < 10000 && offset + 8 <= bytes.length; chunks++) {
+          const type = chunkType(offset);
+          const size = view.getUint32(offset + 4, true);
+          const start = offset + 8;
+          const end = start + size;
+          const paddedEnd = end + (size & 1);
+          if (paddedEnd > bytes.length) { validStructure = false; break; }
+          if (type === "VP8X") {
+            // Extended WebP headers describe a canvas but contain no pixels.
+            // Require the exact header shape and a later image/frame payload.
+            if (offset !== 12 || size !== 10 || (bytes[start] & 0xc1) !== 0 ||
+                bytes[start + 1] || bytes[start + 2] || bytes[start + 3]) {
+              validStructure = false;
+              break;
+            }
+          } else if (validFrameChunk(type, start, size)) {
+            hasImagePayload = true;
+          } else if (type === "ANMF") {
+            if (size < 24) { validStructure = false; break; }
+            let frameOffset = start + 16;
+            let validFrame = false;
+            while (frameOffset + 8 <= end) {
+              const frameType = chunkType(frameOffset);
+              const frameSize = view.getUint32(frameOffset + 4, true);
+              const frameStart = frameOffset + 8;
+              const frameEnd = frameStart + frameSize;
+              const paddedFrameEnd = frameEnd + (frameSize & 1);
+              if (paddedFrameEnd > end) { validStructure = false; break; }
+              if (validFrameChunk(frameType, frameStart, frameSize)) validFrame = true;
+              frameOffset = paddedFrameEnd;
+            }
+            if (!validStructure || frameOffset !== end || !validFrame) {
+              validStructure = false;
+              break;
+            }
+            hasImagePayload = true;
+          }
+          offset = paddedEnd;
         }
-        else if (paddedEnd <= bytes.length && type === "VP8X" && size >= 10)
-          dimensions = (bytes[24] | (bytes[25] << 8) | (bytes[26] << 16)) < 0xffffff &&
-            (bytes[27] | (bytes[28] << 8) | (bytes[29] << 16)) < 0xffffff;
-        if (dimensions) return "webp";
+        if (validStructure && offset === bytes.length && hasImagePayload) return "webp";
       }
       throw new Error("response is not a complete supported cover image while fetching " + url);
     } else if (kind === "wav") {
